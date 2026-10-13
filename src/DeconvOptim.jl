@@ -41,6 +41,7 @@ include("utils.jl")
 include("conv.jl")
 include("generic_invert.jl")
 include("lucy_richardson.jl")
+include("map_cj.jl")
 include("deconvolution.jl")
 include("analysis_tools.jl")
 

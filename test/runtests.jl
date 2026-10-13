@@ -18,6 +18,7 @@ include("utils.jl")
 
 include("analysis_tools.jl")
 include("hessian_schatten_norm.jl")
+include("map_cj.jl")
 include("conv.jl")
 include("mappings.jl")
 
@@ -29,5 +30,3 @@ include("lossfunctions.jl")
 include("regularizer.jl")
 
 include("main.jl")
-
-
