@@ -14,6 +14,8 @@ Converges slower than the optimization approach of `deconvolution`
 - `iterations=100`: Specifies number of iterations.
 - `progress`: if not `nothing`, the progress will be monitored in a summary dictionary as obtained by
               DeconvOptim.options_trace_deconv()
+- `rec0=nothing`: optional initial reconstruction guess (same size as `measured`). When `nothing`
+              (the default), the iteration starts from `abs.(conv_temp(measured, otf))` as before.
 
 # Example
 ```julia-repl
@@ -30,18 +32,20 @@ julia> img_n = poisson(img_b, 300);
 julia> @time res = richardson_lucy_iterative(img_n, psf);
 ```
 """
-function richardson_lucy_iterative(measured, psf; 
+function richardson_lucy_iterative(measured, psf;
                                    regularizer=GR(),
                                    λ=0.05,
                                    iterations=100,
                                    conv_dims=1:ndims(psf),
-                                   progress = nothing)
+                                   progress = nothing,
+                                   rec0 = nothing)
 
 
-    otf, conv_temp = plan_conv(measured, psf, conv_dims) 
+    otf, conv_temp = plan_conv(measured, psf, conv_dims)
     otf_conj = conj.(otf)
-    # initializer
-    rec = abs.(conv_temp(measured, otf))#ones(eltype(measured), size(measured))
+    # initializer — a copy since `rec` is mutated in place (`.*=`) below, and
+    # the caller may want to reuse `rec0` elsewhere.
+    rec = rec0 === nothing ? abs.(conv_temp(measured, otf)) : copy(rec0)
     
     # buffer for gradient
     # we need Base.invokelatest because of world age issues with generated
@@ -58,8 +62,13 @@ function richardson_lucy_iterative(measured, psf;
 
     buffer = copy(measured)
 
+    # Float32 FFT round-off makes the forward convolution slightly negative in
+    # dark (near-zero) regions; dividing by / taking the log of that yields
+    # Inf/NaN, which the next FFT then spreads over the whole array. Clamp the
+    # forward model to a tiny positive floor.
+    fwd_floor = eps(real(eltype(measured)))
     iter_without_reg(rec) = begin
-        buffer .= measured ./ (conv_temp(rec, otf))
+        buffer .= measured ./ max.(conv_temp(rec, otf), fwd_floor)
         conv_temp(buffer, otf_conj)
     end
     iter_with_reg(rec) = buffer .= (iter_without_reg(rec) .- λ .* ∇reg(rec))
@@ -68,7 +77,7 @@ function richardson_lucy_iterative(measured, psf;
 
     # the loss function is only needed for logging, not for LR itself
     loss(myrec) = begin
-        fwd = conv_temp(myrec, otf)
+        fwd = max.(conv_temp(myrec, otf), fwd_floor)
         return sum(fwd .- measured .* log.(fwd))
     end
 
@@ -82,7 +91,9 @@ function richardson_lucy_iterative(measured, psf;
 
     # do actual optimization
     for i in 1:iterations
-        rec .*= iter(rec)
+        # the multiplicative update must stay non-negative (round-off or the
+        # regularizer term can push it slightly below zero)
+        rec .*= max.(iter(rec), zero(eltype(rec)))
         if progress !== nothing
             # do not count the time for evaluating the loss here.
             code_time += time() .- tmp_time
