@@ -6,9 +6,14 @@ using KernelAbstractions: @kernel, @index, @groupsize, @uniform, @localmem,
 """
     map_cj(measured, psf; <keyword arguments>)
 
-Poisson maximum-a-posteriori deconvolution using the square mapping
+Maximum-a-posteriori deconvolution using the square mapping
 `object = x.^2`, Fletcher--Reeves conjugate gradients, and an analytic
-Newton line search.
+Newton line search. The data term is the Poisson negative log-likelihood
+(`loss=:poisson`) or the Anscombe-type variance-stabilized least squares
+`sum(abs2.(sqrt.(μ .+ β) .- sqrt.(measured .+ β)))` (`loss=:anscombe`),
+with `μ` the blurred object plus background. Both are functions of `μ`,
+which is a quadratic polynomial in the step length, so the line search is
+exact for either choice.
 
 `penalty=:good` selects MAPPR's Good/Laplacian penalty on the signed
 optimization variable `x`. `penalty=:hessian_frobenius` selects the
@@ -16,10 +21,19 @@ smoothed Frobenius norm of the Hessian of `x.^2`.
 
 # Keyword arguments
 - `penalty=:good`: either `:good` or `:hessian_frobenius`.
+- `loss=:poisson`: data term, either `:poisson` or `:anscombe`.
+- `anscombe_offset=3/8`: the offset `β` of the `:anscombe` loss, in units of
+  the measured counts (the data are not normalized by `map_cj`).
 - `gamma=0.0`: nonnegative regularization strength.
 - `epsilon=nothing`: positive Frobenius smoothing; defaults to
   `sqrt(eps(eltype(measured)))`.
-- `spacing=ones(ndims(measured))`: sample spacing for Hessian differences.
+- `weights=nothing`: one nonnegative weight per dimension, with the same
+  meaning as in `GR`, `Tikhonov`, `TV` and `TH`: `weights[d]` multiplies the
+  second difference along dimension `d`. For sampling distances `S_d` use
+  `weights[d] = 1 / S_d^2`. The Good Laplacian is `sum_d weights[d] * Δ²_d`;
+  in the Hessian, the diagonal entry `(d, d)` is scaled by `weights[d]` and
+  the mixed entry `(d, e)` by `sqrt(weights[d] * weights[e])`, which matches
+  `TH`. `nothing` means all ones.
 - `background=0`: nonnegative Poisson background.
 - `iterations=60`: number of conjugate-gradient iterations.
 - `newton_iterations=3`: Newton sub-iterations in each line search.
@@ -55,8 +69,10 @@ KernelAbstractions on the input array's backend.
 function map_cj(measured::AbstractArray, psf::AbstractArray;
                penalty=:good,
                gamma=0.0,
+               loss=:poisson,
+               anscombe_offset=3 / 8,
                epsilon=nothing,
-               spacing=nothing,
+               weights=nothing,
                background=0.0,
                iterations=60,
                newton_iterations=3,
@@ -78,6 +94,10 @@ function map_cj(measured::AbstractArray, psf::AbstractArray;
         throw(ArgumentError("`padding` must be finite"))
     penalty in (:good, :hessian_frobenius) ||
         throw(ArgumentError("`penalty` must be :good or :hessian_frobenius"))
+    loss in (:poisson, :anscombe) ||
+        throw(ArgumentError("`loss` must be :poisson or :anscombe"))
+    isfinite(anscombe_offset) && anscombe_offset > 0 ||
+        throw(ArgumentError("`anscombe_offset` must be positive and finite"))
     isfinite(gamma) && gamma >= 0 ||
         throw(ArgumentError("`gamma` must be nonnegative and finite"))
     isfinite(background) && background >= 0 ||
@@ -143,9 +163,11 @@ function map_cj(measured::AbstractArray, psf::AbstractArray;
     eps_hessian = epsilon === nothing ? sqrt(eps(T)) : T(epsilon)
     isfinite(eps_hessian) && eps_hessian > 0 ||
         throw(ArgumentError("`epsilon` must be positive and finite"))
-    spacings = spacing === nothing ? ntuple(_ -> one(T), N) : Tuple(T.(spacing))
-    length(spacings) == N && all(s -> isfinite(s) && s > 0, spacings) ||
-        throw(ArgumentError("`spacing` must contain one positive finite value per dimension"))
+    dim_weights = weights === nothing ? ntuple(_ -> one(T), N) : Tuple(T.(weights))
+    length(dim_weights) == N && all(w -> isfinite(w) && w >= 0, dim_weights) ||
+        throw(ArgumentError("`weights` must contain one nonnegative finite value per dimension"))
+    offset = T(anscombe_offset)
+    sqrt_data = loss === :anscombe ? sqrt.(data .+ offset) : nothing
 
     x = similar(data)
     if initial === nothing
@@ -205,18 +227,21 @@ function map_cj(measured::AbstractArray, psf::AbstractArray;
 
     if penalty === :hessian_frobenius
         for k in eachindex(hessian_pairs)
-            _mappr_hessian!(hessian_a[k], object, hessian_pairs[k]..., spacings)
+            _mappr_hessian!(hessian_a[k], object, hessian_pairs[k]..., dim_weights)
         end
     end
 
     good_l0 = 0.0
 
     for iteration in 1:iterations
-        if mask === nothing
+        if loss === :poisson
             @. residual = one(T) - data / max(model + T(background), eps_mu)
         else
-            @. residual = mask * (one(T) -
-                data / max(model + T(background), eps_mu))
+            @. residual = one(T) - sqrt_data /
+                sqrt(max(model + T(background), zero(T)) + offset)
+        end
+        if mask !== nothing
+            @. residual *= mask
         end
         copyto!(gradient, convolve(residual, otf_conj))
 
@@ -224,8 +249,9 @@ function map_cj(measured::AbstractArray, psf::AbstractArray;
         # i.e. the object-space gradient g_f for the square-mapped penalty,
         # until the line search reuses the buffer.
         if penalty === :good
-            _mappr_laplacian!(l_x, x)
-            @. line_work = gradient + 8 * T(gamma) * N
+            _mappr_laplacian!(l_x, x, dim_weights)
+            good_curvature = 8 * T(gamma) * sum(dim_weights)
+            @. line_work = gradient + good_curvature
             @. gradient = 2 * x * gradient - 8 * T(gamma) * l_x
             good_l0 = _map_cj_dot(x, l_x, dot_partials)
         else
@@ -242,7 +268,7 @@ function map_cj(measured::AbstractArray, psf::AbstractArray;
                 w = hessian_weights[k]
                 @. hessian_q = w * a / hessian_r
                 _mappr_add_hessian_adjoint!(hessian_grad, hessian_q,
-                                             hessian_pairs[k]..., spacings)
+                                             hessian_pairs[k]..., dim_weights)
             end
             @. line_work = gradient + T(gamma) * hessian_grad
             @. gradient = 2 * x * line_work
@@ -279,8 +305,8 @@ function map_cj(measured::AbstractArray, psf::AbstractArray;
             end
             for k in eachindex(hessian_a)
                 d, e = hessian_pairs[k]
-                _mappr_hessian!(hessian_b, cross_term, d, e, spacings)
-                _mappr_hessian!(hessian_c, direction_sq, d, e, spacings)
+                _mappr_hessian!(hessian_b, cross_term, d, e, dim_weights)
+                _mappr_hessian!(hessian_c, direction_sq, d, e, dim_weights)
                 a = hessian_a[k]
                 w = hessian_weights[k]
                 @. sigma[2] += 2 * w * a * hessian_b
@@ -291,18 +317,20 @@ function map_cj(measured::AbstractArray, psf::AbstractArray;
         end
 
         if penalty === :good
-            _mappr_laplacian!(l_direction, direction)
+            _mappr_laplacian!(l_direction, direction, dim_weights)
             d_ld = _map_cj_dot(direction, l_direction, dot_partials)
             d_lx = _map_cj_dot(direction, l_x, dot_partials)
             alpha = _mappr_newton_step(model, m1, m2, data, T(background),
                                        penalty, T(gamma), newton_iterations,
                                        good_l0, d_lx, d_ld, sigma, mask,
-                                       line_mu, line_mu1, line_mu2, line_work)
+                                       line_mu, line_mu1, line_mu2, line_work;
+                                       loss, sqrt_data, beta=offset)
         else
             alpha = _mappr_newton_step(model, m1, m2, data, T(background),
                                        penalty, T(gamma), newton_iterations,
                                        0.0, 0.0, 0.0, sigma, mask,
-                                       line_mu, line_mu1, line_mu2, line_work)
+                                       line_mu, line_mu1, line_mu2, line_work;
+                                       loss, sqrt_data, beta=offset)
         end
 
         if penalty === :hessian_frobenius
@@ -311,8 +339,8 @@ function map_cj(measured::AbstractArray, psf::AbstractArray;
             alpha_sq = alpha * alpha
             for k in eachindex(hessian_a)
                 d, e = hessian_pairs[k]
-                _mappr_hessian!(hessian_b, cross_term, d, e, spacings)
-                _mappr_hessian!(hessian_c, direction_sq, d, e, spacings)
+                _mappr_hessian!(hessian_b, cross_term, d, e, dim_weights)
+                _mappr_hessian!(hessian_c, direction_sq, d, e, dim_weights)
                 @. hessian_a[k] += alpha * hessian_b + alpha_sq * hessian_c
             end
         end
@@ -331,6 +359,25 @@ function map_cj(measured::AbstractArray, psf::AbstractArray;
 
     return padded && padding > 0 ? center_extract(object, size(measured_data)) :
            object
+end
+
+# Adds a negative-curvature component to `direction` at voxels that sit (almost)
+# at x = 0 although the object-space gradient `g_f` pulls them upwards. Along
+# the line these voxels change as (x + αd)^2 ≈ α^2 d^2, so the line function
+# stays polynomial and the exact line search remains valid.
+function _mappr_saddle_escape!(direction, x, object, g_f, pull, strength,
+                               threshold, dot_partials)
+    T = eltype(direction)
+    level = threshold * maximum(object)
+    @. pull = ifelse((object <= level) & (g_f < 0), -g_f, zero(T))
+    max_pull = maximum(pull)
+    max_pull > 0 || return direction
+    rms_direction = sqrt(_map_cj_dot(direction, direction, dot_partials) /
+                         length(direction))
+    rms_direction > 0 || return direction
+    scale = strength * rms_direction
+    @. direction += ifelse(x < 0, -scale, scale) * sqrt(pull / max_pull)
+    return direction
 end
 
 function _mappr_convolve!(out, tmp, x, d, convolve, otf)
@@ -385,27 +432,27 @@ function _mappr_hessian_pairs(N)
     return pairs, weights
 end
 
-@kernel function _mappr_hessian_kernel!(out, x, d, e, spacing)
+@kernel function _mappr_hessian_kernel!(out, x, d, e, weights)
     I = @index(Global, Cartesian)
     N = ndims(x)
     sz = size(x)
     if d == e
         ip = ntuple(k -> k == d ? min(I[k] + 1, sz[k]) : I[k], Val(N))
         im = ntuple(k -> k == d ? max(I[k] - 1, 1) : I[k], Val(N))
-        scale = inv(spacing[d] * spacing[d])
+        scale = weights[d]
         @inbounds out[I] = (x[ip...] - 2 * x[I] + x[im...]) * scale
     elseif I[d] < sz[d] && I[e] < sz[e]
         id = ntuple(k -> k == d ? I[k] + 1 : I[k], Val(N))
         ie = ntuple(k -> k == e ? I[k] + 1 : I[k], Val(N))
         ide = ntuple(k -> k == d || k == e ? I[k] + 1 : I[k], Val(N))
-        scale = inv(spacing[d] * spacing[e])
+        scale = sqrt(weights[d] * weights[e])
         @inbounds out[I] = (x[ide...] - x[id...] - x[ie...] + x[I]) * scale
     else
         @inbounds out[I] = zero(eltype(out))
     end
 end
 
-@kernel function _mappr_hessian_adjoint_kernel!(out, x, d, e, spacing)
+@kernel function _mappr_hessian_adjoint_kernel!(out, x, d, e, weights)
     I = @index(Global, Cartesian)
     N = ndims(x)
     sz = size(x)
@@ -413,7 +460,7 @@ end
     if d == e
         n = sz[d]
         if n > 1
-            scale = inv(spacing[d] * spacing[d])
+            scale = weights[d]
             v = (I[d] == 1 || I[d] == n ? -one(eltype(out)) :
                  -2 * one(eltype(out))) * x[I] * scale
             if I[d] > 1
@@ -426,7 +473,7 @@ end
             end
         end
     else
-        scale = inv(spacing[d] * spacing[e])
+        scale = sqrt(weights[d] * weights[e])
         if I[d] < sz[d] && I[e] < sz[e]
             @inbounds v += x[I] * scale
         end
@@ -446,41 +493,42 @@ end
     @inbounds out[I] += v
 end
 
-@kernel function _mappr_laplacian_kernel!(out, x)
+@kernel function _mappr_laplacian_kernel!(out, x, weights)
     I = @index(Global, Cartesian)
     N = ndims(x)
     sz = size(x)
-    v = -2 * N * @inbounds(x[I])
+    v = zero(eltype(out))
     for d in 1:N
         ip = ntuple(k -> k == d ? min(I[k] + 1, sz[k]) : I[k], Val(N))
         im = ntuple(k -> k == d ? max(I[k] - 1, 1) : I[k], Val(N))
-        @inbounds v += x[ip...] + x[im...]
+        @inbounds v += weights[d] * (x[ip...] - 2 * x[I] + x[im...])
     end
     @inbounds out[I] = v
 end
 
-function _mappr_hessian!(out, x, d, e, spacing)
+function _mappr_hessian!(out, x, d, e, weights)
     backend = KernelAbstractions.get_backend(x)
-    _mappr_hessian_kernel!(backend)(out, x, d, e, spacing; ndrange=size(x))
+    _mappr_hessian_kernel!(backend)(out, x, d, e, weights; ndrange=size(x))
     return out
 end
 
-function _mappr_add_hessian_adjoint!(out, x, d, e, spacing)
+function _mappr_add_hessian_adjoint!(out, x, d, e, weights)
     backend = KernelAbstractions.get_backend(x)
-    _mappr_hessian_adjoint_kernel!(backend)(out, x, d, e, spacing;
+    _mappr_hessian_adjoint_kernel!(backend)(out, x, d, e, weights;
                                             ndrange=size(x))
     return out
 end
 
-function _mappr_laplacian!(out, x)
+function _mappr_laplacian!(out, x, weights=ntuple(_ -> one(eltype(x)), ndims(x)))
     backend = KernelAbstractions.get_backend(x)
-    _mappr_laplacian_kernel!(backend)(out, x; ndrange=size(x))
+    _mappr_laplacian_kernel!(backend)(out, x, weights; ndrange=size(x))
     return out
 end
 
 function _mappr_line_eval(alpha, model, m1, m2, data, background, penalty,
                           gamma, good_l0, d_lx, d_ld, sigma, mask, line_mu,
-                          line_mu1, line_mu2, line_work)
+                          line_mu1, line_mu2, line_work;
+                          loss=:poisson, sqrt_data=nothing, beta=3 / 8)
     alpha2 = alpha * alpha
     floor_mu = eps(eltype(data))
     @. line_mu1 = ifelse(model + 2 * alpha * m1 + alpha2 * m2 +
@@ -491,26 +539,14 @@ function _mappr_line_eval(alpha, model, m1, m2, data, background, penalty,
                          2 * m2, zero(eltype(data)))
     @. line_mu = max(model + 2 * alpha * m1 + alpha2 * m2 +
                      background, floor_mu)
-    if mask === nothing
-        @. line_work = line_mu - data * log(line_mu)
+    if loss === :poisson
+        phi, dphi, d2phi = _mappr_poisson_line(data, mask, line_mu, line_mu1,
+                                               line_mu2, line_work)
     else
-        @. line_work = mask * (line_mu - data * log(line_mu))
+        sqrt_g = sqrt_data === nothing ? sqrt.(data .+ beta) : sqrt_data
+        phi, dphi, d2phi = _mappr_anscombe_line(sqrt_g, beta, mask, line_mu,
+                                                line_mu1, line_mu2, line_work)
     end
-    phi = sum(line_work)
-    if mask === nothing
-        @. line_work = (1 - data / line_mu) * line_mu1
-    else
-        @. line_work = mask * (1 - data / line_mu) * line_mu1
-    end
-    dphi = sum(line_work)
-    if mask === nothing
-        @. line_work = (1 - data / line_mu) * line_mu2 +
-                       data * (line_mu1 / line_mu)^2
-    else
-        @. line_work = mask * ((1 - data / line_mu) * line_mu2 +
-                               data * (line_mu1 / line_mu)^2)
-    end
-    d2phi = sum(line_work)
 
     if penalty === :good
         phi -= 4 * gamma * (good_l0 + 2 * alpha * d_lx + alpha2 * d_ld)
@@ -534,21 +570,72 @@ function _mappr_line_eval(alpha, model, m1, m2, data, background, penalty,
     return phi, dphi, d2phi
 end
 
+# Poisson negative log-likelihood sum(μ - g log μ) and its first two
+# derivatives along the line, given μ, μ' and μ'' per voxel.
+function _mappr_poisson_line(data, mask, mu, mu1, mu2, work)
+    if mask === nothing
+        @. work = mu - data * log(mu)
+    else
+        @. work = mask * (mu - data * log(mu))
+    end
+    phi = sum(work)
+    if mask === nothing
+        @. work = (1 - data / mu) * mu1
+    else
+        @. work = mask * (1 - data / mu) * mu1
+    end
+    dphi = sum(work)
+    if mask === nothing
+        @. work = (1 - data / mu) * mu2 + data * (mu1 / mu)^2
+    else
+        @. work = mask * ((1 - data / mu) * mu2 + data * (mu1 / mu)^2)
+    end
+    return phi, dphi, sum(work)
+end
+
+# Anscombe loss sum((sqrt(μ + β) - sqrt(g + β))^2) along the line, with
+# M = μ + β and sqrt_g = sqrt(g + β):
+#   phi'  = sum((1 - sqrt_g / sqrt(M)) μ')
+#   phi'' = sum((1 - sqrt_g / sqrt(M)) μ'' + sqrt_g μ'^2 / (2 M sqrt(M)))
+function _mappr_anscombe_line(sqrt_g, beta, mask, mu, mu1, mu2, work)
+    if mask === nothing
+        @. work = abs2(sqrt(mu + beta) - sqrt_g)
+    else
+        @. work = mask * abs2(sqrt(mu + beta) - sqrt_g)
+    end
+    phi = sum(work)
+    if mask === nothing
+        @. work = (1 - sqrt_g / sqrt(mu + beta)) * mu1
+    else
+        @. work = mask * (1 - sqrt_g / sqrt(mu + beta)) * mu1
+    end
+    dphi = sum(work)
+    if mask === nothing
+        @. work = (1 - sqrt_g / sqrt(mu + beta)) * mu2 +
+                  sqrt_g * mu1^2 / (2 * (mu + beta) * sqrt(mu + beta))
+    else
+        @. work = mask * ((1 - sqrt_g / sqrt(mu + beta)) * mu2 +
+                  sqrt_g * mu1^2 / (2 * (mu + beta) * sqrt(mu + beta)))
+    end
+    return phi, dphi, sum(work)
+end
+
 function _mappr_newton_step(model, m1, m2, data, background, penalty,
                             gamma, newton_iterations, good_l0, d_lx, d_ld,
-                            sigma, mask, line_mu, line_mu1, line_mu2, line_work)
+                            sigma, mask, line_mu, line_mu1, line_mu2, line_work;
+                            line_kw...)
     phi0, _, _ = _mappr_line_eval(0.0, model, m1, m2, data, background,
                                   penalty, gamma, good_l0, d_lx, d_ld, sigma,
-                                  mask, line_mu, line_mu1, line_mu2, line_work)
+                                  mask, line_mu, line_mu1, line_mu2, line_work; line_kw...)
     alpha = one(eltype(data))
     phi, _, _ = _mappr_line_eval(alpha, model, m1, m2, data, background,
                                  penalty, gamma, good_l0, d_lx, d_ld, sigma,
-                                 mask, line_mu, line_mu1, line_mu2, line_work)
+                                 mask, line_mu, line_mu1, line_mu2, line_work; line_kw...)
     while (!isfinite(phi) || phi >= phi0) && alpha > eps(eltype(data))
         alpha *= 0.5
         phi, _, _ = _mappr_line_eval(alpha, model, m1, m2, data, background,
                                      penalty, gamma, good_l0, d_lx, d_ld, sigma,
-                                     mask, line_mu, line_mu1, line_mu2, line_work)
+                                     mask, line_mu, line_mu1, line_mu2, line_work; line_kw...)
     end
     if !isfinite(phi) || phi >= phi0
         return 0.0
@@ -561,7 +648,7 @@ function _mappr_newton_step(model, m1, m2, data, background, penalty,
                                           background, penalty, gamma,
                                           good_l0, d_lx, d_ld, sigma,
                                           mask, line_mu, line_mu1, line_mu2,
-                                          line_work)
+                                          line_work; line_kw...)
         candidate = isfinite(d2phi) && d2phi > 0 ?
                     alpha - dphi / d2phi : alpha / 2
         if !isfinite(candidate) || candidate <= 0
@@ -571,7 +658,7 @@ function _mappr_newton_step(model, m1, m2, data, background, penalty,
                                                data, background, penalty,
                                                gamma, good_l0, d_lx, d_ld,
                                                sigma, mask, line_mu, line_mu1,
-                                               line_mu2, line_work)
+                                               line_mu2, line_work; line_kw...)
         while (!isfinite(candidate_phi) || candidate_phi >= best_phi) &&
               candidate > eps(eltype(data))
             candidate *= 0.5
@@ -579,7 +666,7 @@ function _mappr_newton_step(model, m1, m2, data, background, penalty,
                                                    data, background, penalty,
                                                    gamma, good_l0, d_lx, d_ld,
                                                    sigma, mask, line_mu, line_mu1,
-                                                   line_mu2, line_work)
+                                                   line_mu2, line_work; line_kw...)
         end
         if isfinite(candidate_phi) && candidate_phi < best_phi
             alpha = candidate
