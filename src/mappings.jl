@@ -3,6 +3,7 @@ export Map_0_1
 export Piecewise_positive
 export Pow4_positive
 export Abs_positive
+export Continuously_positive
  
 
  # All these functions return a mapping function and 
@@ -102,10 +103,10 @@ end
 
 Returns a function and an inverse function 
 to map numbers to larger than 0 via
-a strictly monotonic positive function: x+sqr(x^2+4).
+a strictly monotonic positive function: x+sqrt(x^2+4).
 """
 function Continuously_positive()
-    return f_pw_pos, f_pw_pos_inv
+    return f_pw_cpos, f_pw_cpos_inv
 end
 
 f_pw_cpos(x) = x .+ sqrt.(abs2.(x).+4)

@@ -1,6 +1,7 @@
 export map_cj
 import KernelAbstractions
-using KernelAbstractions: @kernel, @index
+using KernelAbstractions: @kernel, @index, @groupsize, @uniform, @localmem,
+                          @synchronize
 
 """
     map_cj(measured, psf; <keyword arguments>)
@@ -22,10 +23,27 @@ smoothed Frobenius norm of the Hessian of `x.^2`.
 - `background=0`: nonnegative Poisson background.
 - `iterations=60`: number of conjugate-gradient iterations.
 - `newton_iterations=3`: Newton sub-iterations in each line search.
-- `initial=nothing`: initial object estimate (scalar or same-size array);
+- `saddle_escape=1.0`: strength of the saddle-escape term added to the search
+  direction. With `object = x.^2` the gradient `2x .* g_f` vanishes at
+  `x == 0` even where the object-space gradient `g_f` asks the voxel to grow;
+  such points are saddles with curvature `2g_f < 0` along the voxel. For
+  voxels with `object <= escape_threshold * maximum(object)` and `g_f < 0`
+  the direction gets an extra component
+  `saddle_escape * rms(direction) * sqrt(g_f / minimum(g_f))`, which the exact
+  polynomial line search handles like any other direction. `0` disables it.
+- `escape_threshold=1e-4`: relative object level below which voxels are
+  considered stuck.
+- `padding=0.0`: fractional padding per side, matching `deconvolution`.
+  Positive values pad the optimization domain and crop the returned object
+  back to the measured size; negative values retain the padded output.
+- `initial=nothing`: initial object estimate (scalar or measured-/padded-size array);
   the optimization starts at its nonnegative square root.
 - `conv_dims=1:ndims(measured)`: dimensions over which to convolve.
 - `normalize_psf=true`: normalize the PSF to unit sum.
+- `callback=nothing`: optional function `callback(iteration, object, model)`
+  called after every iteration with the current reconstruction `x.^2` and
+  forward model (without background). Returning `true` stops the iteration
+  early (the current reconstruction is returned).
 
 The returned array is the reconstructed object `x.^2`. Unlike the
 historical C++ implementation, the signed variable is not folded with
@@ -42,9 +60,13 @@ function map_cj(measured::AbstractArray, psf::AbstractArray;
                background=0.0,
                iterations=60,
                newton_iterations=3,
+               saddle_escape=1.0,
+               escape_threshold=1e-4,
                initial=nothing,
                conv_dims=1:ndims(measured),
-               normalize_psf=true)
+               normalize_psf=true,
+               padding=0.0,
+               callback=nothing)
     N = ndims(measured)
     eltype(measured) <: Real && eltype(psf) <: Real ||
         throw(ArgumentError("`measured` and `psf` must contain real-valued data"))
@@ -52,6 +74,8 @@ function map_cj(measured::AbstractArray, psf::AbstractArray;
         throw(ArgumentError("`measured` and `psf` must have the same number of dimensions"))
     all(size(psf, d) <= size(measured, d) for d in 1:N) ||
         throw(ArgumentError("`psf` dimensions must not exceed `measured` dimensions"))
+    padding isa Real && isfinite(padding) ||
+        throw(ArgumentError("`padding` must be finite"))
     penalty in (:good, :hessian_frobenius) ||
         throw(ArgumentError("`penalty` must be :good or :hessian_frobenius"))
     isfinite(gamma) && gamma >= 0 ||
@@ -62,13 +86,17 @@ function map_cj(measured::AbstractArray, psf::AbstractArray;
         throw(ArgumentError("`iterations` must be a nonnegative integer"))
     newton_iterations isa Integer && newton_iterations >= 0 ||
         throw(ArgumentError("`newton_iterations` must be a nonnegative integer"))
+    isfinite(saddle_escape) && saddle_escape >= 0 ||
+        throw(ArgumentError("`saddle_escape` must be nonnegative and finite"))
+    isfinite(escape_threshold) && escape_threshold >= 0 ||
+        throw(ArgumentError("`escape_threshold` must be nonnegative and finite"))
 
     T = promote_type(float(eltype(measured)), float(eltype(psf)))
-    data = T.(measured)
-    any(v -> !isfinite(v) || v < zero(T), data) &&
+    measured_data = T.(measured)
+    any((.!isfinite.(measured_data)) .| (measured_data .< zero(T))) &&
         throw(ArgumentError("Poisson measurements must be nonnegative and finite"))
     psf_data = T.(psf)
-    all(isfinite, psf_data) ||
+    any(.!isfinite.(psf_data)) &&
         throw(ArgumentError("`psf` must contain only finite values"))
     conv_dims = Tuple(Int.(collect(conv_dims)))
     all(d -> 1 <= d <= N, conv_dims) ||
@@ -79,6 +107,29 @@ function map_cj(measured::AbstractArray, psf::AbstractArray;
         isfinite(psf_sum) && psf_sum > 0 ||
             throw(ArgumentError("`psf` must have a positive finite sum when normalized"))
         psf_data ./= psf_sum
+    end
+
+    size_padded = ntuple(N) do d
+        if size(measured, d) == 1 || iszero(padding)
+            size(measured, d)
+        else
+            pad = next_fast_fft_size(max(4, 2 * round(Int,
+                size(measured, d) * abs(padding))))
+            size(measured, d) + pad
+        end
+    end
+    padded = any(size_padded[d] != size(measured, d) for d in 1:N)
+    data = similar(measured_data, T, size_padded)
+    fill!(data, zero(T))
+    mask = padded ? similar(data) : nothing
+    if padded
+        fill!(mask, zero(T))
+        center_set!(data, measured_data)
+        measured_mask = similar(measured_data)
+        fill!(measured_mask, one(T))
+        center_set!(mask, measured_mask)
+    else
+        copyto!(data, measured_data)
     end
 
     psf_full = similar(data, T, size(data))
@@ -98,18 +149,25 @@ function map_cj(measured::AbstractArray, psf::AbstractArray;
 
     x = similar(data)
     if initial === nothing
-        fill!(x, sqrt(max(mean(data) - T(background), eps_mu)))
+        fill!(x, sqrt(max(mean(measured_data) - T(background), eps_mu)))
     elseif initial isa Number
         isfinite(initial) && initial >= 0 ||
             throw(ArgumentError("`initial` must be nonnegative and finite"))
         fill!(x, sqrt(T(initial)))
     else
-        size(initial) == size(data) ||
-            throw(ArgumentError("array-valued `initial` must have the same size as `measured`"))
-        any(v -> !isfinite(v) || v < 0, initial) &&
+        size(initial) == size(measured_data) || size(initial) == size(data) ||
+            throw(ArgumentError("array-valued `initial` must have the measured or padded size"))
+        any((.!isfinite.(initial)) .| (initial .< 0)) &&
             throw(ArgumentError("`initial` must be nonnegative and finite"))
-        copyto!(x, initial)
-        @. x = sqrt(x)
+        initial_data = similar(data, T, size(initial))
+        copyto!(initial_data, initial)
+        @. initial_data = sqrt(initial_data)
+        if size(initial_data) == size(data)
+            copyto!(x, initial_data)
+        else
+            fill!(x, sqrt(max(mean(measured_data) - T(background), eps_mu)))
+            center_set!(x, initial_data)
+        end
     end
 
     object = similar(data)
@@ -122,6 +180,7 @@ function map_cj(measured::AbstractArray, psf::AbstractArray;
     direction = similar(data)
     residual = similar(data)
     l_x = similar(data)
+    l_direction = penalty === :good ? similar(data) : nothing
     m1 = similar(data)
     m2 = similar(data)
     direction_sq = similar(data)
@@ -130,6 +189,7 @@ function map_cj(measured::AbstractArray, psf::AbstractArray;
     line_mu1 = similar(data)
     line_mu2 = similar(data)
     line_work = similar(data)
+    dot_partials = similar(data, T, cld(length(data), 256))
 
     hessian_pairs, hessian_weights = _mappr_hessian_pairs(N)
     hessian_weights = T.(hessian_weights)
@@ -150,19 +210,24 @@ function map_cj(measured::AbstractArray, psf::AbstractArray;
     end
 
     good_l0 = 0.0
-    if penalty === :good
-        _mappr_laplacian!(l_x, x)
-        good_l0 = dot(x, l_x)
-    end
 
     for iteration in 1:iterations
-        @. residual = one(T) - data / max(model + T(background), eps_mu)
+        if mask === nothing
+            @. residual = one(T) - data / max(model + T(background), eps_mu)
+        else
+            @. residual = mask * (one(T) -
+                data / max(model + T(background), eps_mu))
+        end
         copyto!(gradient, convolve(residual, otf_conj))
 
+        # line_work holds half the diagonal curvature d²Psi/dx_i² at x_i = 0,
+        # i.e. the object-space gradient g_f for the square-mapped penalty,
+        # until the line search reuses the buffer.
         if penalty === :good
             _mappr_laplacian!(l_x, x)
+            @. line_work = gradient + 8 * T(gamma) * N
             @. gradient = 2 * x * gradient - 8 * T(gamma) * l_x
-            good_l0 = dot(x, l_x)
+            good_l0 = _map_cj_dot(x, l_x, dot_partials)
         else
             @. hessian_r = T(eps_hessian)^2
             for k in eachindex(hessian_a)
@@ -179,21 +244,29 @@ function map_cj(measured::AbstractArray, psf::AbstractArray;
                 _mappr_add_hessian_adjoint!(hessian_grad, hessian_q,
                                              hessian_pairs[k]..., spacings)
             end
-            @. gradient = 2 * x * (gradient + T(gamma) * hessian_grad)
+            @. line_work = gradient + T(gamma) * hessian_grad
+            @. gradient = 2 * x * line_work
         end
 
         if iteration == 1
             @. direction = -gradient
         else
-            denom = dot(previous_gradient, previous_gradient)
-            beta = iszero(denom) ? zero(T) : dot(gradient, gradient) / denom
+            denom = _map_cj_dot(previous_gradient, previous_gradient,
+                                dot_partials)
+            beta = iszero(denom) ? zero(T) :
+                   _map_cj_dot(gradient, gradient, dot_partials) / denom
             @. direction = beta * direction - gradient
-            if dot(gradient, direction) >= 0
+            if _map_cj_dot(gradient, direction, dot_partials) >= 0
                 @. direction = -gradient
             end
         end
 
         copyto!(previous_gradient, gradient)
+        if saddle_escape > 0
+            _mappr_saddle_escape!(direction, x, object, line_work, line_mu,
+                                  T(saddle_escape), T(escape_threshold),
+                                  dot_partials)
+        end
         _mappr_convolve!(m1, cross_term, x, direction, convolve, otf)
         _mappr_convolve!(m2, direction_sq, direction, direction, convolve, otf)
 
@@ -218,18 +291,17 @@ function map_cj(measured::AbstractArray, psf::AbstractArray;
         end
 
         if penalty === :good
-            _mappr_laplacian!(l_x, direction)
-            d_ld = dot(direction, l_x)
-            _mappr_laplacian!(l_x, x)
-            d_lx = dot(direction, l_x)
+            _mappr_laplacian!(l_direction, direction)
+            d_ld = _map_cj_dot(direction, l_direction, dot_partials)
+            d_lx = _map_cj_dot(direction, l_x, dot_partials)
             alpha = _mappr_newton_step(model, m1, m2, data, T(background),
                                        penalty, T(gamma), newton_iterations,
-                                       good_l0, d_lx, d_ld, sigma,
+                                       good_l0, d_lx, d_ld, sigma, mask,
                                        line_mu, line_mu1, line_mu2, line_work)
         else
             alpha = _mappr_newton_step(model, m1, m2, data, T(background),
                                        penalty, T(gamma), newton_iterations,
-                                       0.0, 0.0, 0.0, sigma,
+                                       0.0, 0.0, 0.0, sigma, mask,
                                        line_mu, line_mu1, line_mu2, line_work)
         end
 
@@ -248,15 +320,55 @@ function map_cj(measured::AbstractArray, psf::AbstractArray;
         @. x += alpha * direction
         @. object = abs2(x)
         @. model += 2 * alpha * m1 + alpha * alpha * m2
+        if callback !== nothing &&
+           callback(iteration, padded && padding > 0 ?
+                    center_extract(object, size(measured_data)) : object,
+                    padded && padding > 0 ?
+                    center_extract(model, size(measured_data)) : model) === true
+            break
+        end
     end
 
-    return object
+    return padded && padding > 0 ? center_extract(object, size(measured_data)) :
+           object
 end
 
 function _mappr_convolve!(out, tmp, x, d, convolve, otf)
     @. tmp = x * d
     copyto!(out, convolve(tmp, otf))
     return out
+end
+
+const MAP_CJ_REDUCTION_WG = 256
+
+@kernel unsafe_indices = true function _map_cj_dot_kernel!(partials, a, b, total)
+    n = @uniform prod(@groupsize())
+    levels = @uniform trailing_zeros(n)
+    idx = @index(Global, Linear)
+    local_idx = @index(Local, Linear)
+    group_idx = @index(Group, Linear)
+    value = idx <= total ? @inbounds(a[idx] * b[idx]) : zero(eltype(a))
+    shared = @localmem eltype(a) (n,)
+    shared[local_idx] = value
+    @synchronize()
+    for level in 1:levels
+        stride = n >> level
+        if local_idx <= stride
+            shared[local_idx] += shared[local_idx + stride]
+        end
+        @synchronize()
+    end
+    if local_idx == 1
+        partials[group_idx] = shared[1]
+    end
+end
+
+function _map_cj_dot(a, b, partials)
+    nblocks = cld(length(a), MAP_CJ_REDUCTION_WG)
+    backend = KernelAbstractions.get_backend(a)
+    _map_cj_dot_kernel!(backend, MAP_CJ_REDUCTION_WG)(partials, a, b, length(a);
+        ndrange=(nblocks * MAP_CJ_REDUCTION_WG,))
+    return sum(Array(view(partials, 1:nblocks)))
 end
 
 function _mappr_hessian_pairs(N)
@@ -367,8 +479,8 @@ function _mappr_laplacian!(out, x)
 end
 
 function _mappr_line_eval(alpha, model, m1, m2, data, background, penalty,
-                          gamma, good_l0, d_lx, d_ld, sigma,
-                          line_mu, line_mu1, line_mu2, line_work)
+                          gamma, good_l0, d_lx, d_ld, sigma, mask, line_mu,
+                          line_mu1, line_mu2, line_work)
     alpha2 = alpha * alpha
     floor_mu = eps(eltype(data))
     @. line_mu1 = ifelse(model + 2 * alpha * m1 + alpha2 * m2 +
@@ -379,12 +491,25 @@ function _mappr_line_eval(alpha, model, m1, m2, data, background, penalty,
                          2 * m2, zero(eltype(data)))
     @. line_mu = max(model + 2 * alpha * m1 + alpha2 * m2 +
                      background, floor_mu)
-    @. line_work = line_mu - data * log(line_mu)
+    if mask === nothing
+        @. line_work = line_mu - data * log(line_mu)
+    else
+        @. line_work = mask * (line_mu - data * log(line_mu))
+    end
     phi = sum(line_work)
-    @. line_work = (1 - data / line_mu) * line_mu1
+    if mask === nothing
+        @. line_work = (1 - data / line_mu) * line_mu1
+    else
+        @. line_work = mask * (1 - data / line_mu) * line_mu1
+    end
     dphi = sum(line_work)
-    @. line_work = (1 - data / line_mu) * line_mu2 +
-                   data * (line_mu1 / line_mu)^2
+    if mask === nothing
+        @. line_work = (1 - data / line_mu) * line_mu2 +
+                       data * (line_mu1 / line_mu)^2
+    else
+        @. line_work = mask * ((1 - data / line_mu) * line_mu2 +
+                               data * (line_mu1 / line_mu)^2)
+    end
     d2phi = sum(line_work)
 
     if penalty === :good
@@ -411,19 +536,19 @@ end
 
 function _mappr_newton_step(model, m1, m2, data, background, penalty,
                             gamma, newton_iterations, good_l0, d_lx, d_ld,
-                            sigma, line_mu, line_mu1, line_mu2, line_work)
+                            sigma, mask, line_mu, line_mu1, line_mu2, line_work)
     phi0, _, _ = _mappr_line_eval(0.0, model, m1, m2, data, background,
                                   penalty, gamma, good_l0, d_lx, d_ld, sigma,
-                                  line_mu, line_mu1, line_mu2, line_work)
+                                  mask, line_mu, line_mu1, line_mu2, line_work)
     alpha = one(eltype(data))
     phi, _, _ = _mappr_line_eval(alpha, model, m1, m2, data, background,
                                  penalty, gamma, good_l0, d_lx, d_ld, sigma,
-                                 line_mu, line_mu1, line_mu2, line_work)
+                                 mask, line_mu, line_mu1, line_mu2, line_work)
     while (!isfinite(phi) || phi >= phi0) && alpha > eps(eltype(data))
         alpha *= 0.5
         phi, _, _ = _mappr_line_eval(alpha, model, m1, m2, data, background,
                                      penalty, gamma, good_l0, d_lx, d_ld, sigma,
-                                     line_mu, line_mu1, line_mu2, line_work)
+                                     mask, line_mu, line_mu1, line_mu2, line_work)
     end
     if !isfinite(phi) || phi >= phi0
         return 0.0
@@ -435,7 +560,8 @@ function _mappr_newton_step(model, m1, m2, data, background, penalty,
         _, dphi, d2phi = _mappr_line_eval(alpha, model, m1, m2, data,
                                           background, penalty, gamma,
                                           good_l0, d_lx, d_ld, sigma,
-                                          line_mu, line_mu1, line_mu2, line_work)
+                                          mask, line_mu, line_mu1, line_mu2,
+                                          line_work)
         candidate = isfinite(d2phi) && d2phi > 0 ?
                     alpha - dphi / d2phi : alpha / 2
         if !isfinite(candidate) || candidate <= 0
@@ -444,7 +570,7 @@ function _mappr_newton_step(model, m1, m2, data, background, penalty,
         candidate_phi, _, _ = _mappr_line_eval(candidate, model, m1, m2,
                                                data, background, penalty,
                                                gamma, good_l0, d_lx, d_ld,
-                                               sigma, line_mu, line_mu1,
+                                               sigma, mask, line_mu, line_mu1,
                                                line_mu2, line_work)
         while (!isfinite(candidate_phi) || candidate_phi >= best_phi) &&
               candidate > eps(eltype(data))
@@ -452,7 +578,7 @@ function _mappr_newton_step(model, m1, m2, data, background, penalty,
             candidate_phi, _, _ = _mappr_line_eval(candidate, model, m1, m2,
                                                    data, background, penalty,
                                                    gamma, good_l0, d_lx, d_ld,
-                                                   sigma, line_mu, line_mu1,
+                                                   sigma, mask, line_mu, line_mu1,
                                                    line_mu2, line_work)
         end
         if isfinite(candidate_phi) && candidate_phi < best_phi
