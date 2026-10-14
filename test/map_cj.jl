@@ -60,6 +60,32 @@ end
 
 end
 
+@testset "MAP-CJ Frobenius line coefficients" begin
+    # s(α) from the cached coefficients must equal the directly computed
+    # ε² + Σ_k w_k [D_k (x + αd)²]² (regression: σ0 once lacked Σ w a²)
+    rng = MersenneTwister(7)
+    x = rand(rng, 7, 8) .+ 0.2
+    d = randn(rng, 7, 8)
+    weights = (1.0, 0.6)
+    epsilon = 0.03
+    pairs, hw = DeconvOptim._mappr_hessian_pairs(2)
+    a = [DeconvOptim._mappr_hessian!(similar(x), x .^ 2, p..., weights)
+         for p in pairs]
+    sigma = ntuple(_ -> similar(x), 5)
+    buffers = ntuple(_ -> similar(x), 4)
+    DeconvOptim._mappr_frobenius_coefficients!(sigma, a, x, d, buffers...,
+                                               pairs, hw, weights, epsilon)
+    h = similar(x)
+    for alpha in (0.0, 0.3, -0.7)
+        direct = fill(epsilon^2, size(x))
+        for (k, p) in enumerate(pairs)
+            DeconvOptim._mappr_hessian!(h, (x .+ alpha .* d) .^ 2, p..., weights)
+            direct .+= hw[k] .* h .^ 2
+        end
+        @test sum(sigma[j] .* alpha^(j - 1) for j in 1:5) ≈ direct
+    end
+end
+
 @testset "MAP-CJ weighted Laplacian" begin
     # weights[d] multiplies the second difference along d, as in GR/Tikhonov
     x = [3.0 * i^2 + 5.0 * j^2 for i in 1:6, j in 1:7]
@@ -167,4 +193,38 @@ end
     end
     @test_throws ArgumentError map_cj(measured, psf; loss=:gaussian)
     @test_throws ArgumentError map_cj(measured, psf; weights=(1.0,))
+end
+
+@testset "MAP-CJ Frobenius line search matches the true objective" begin
+    # Regression: the quartic s(α) must include the current Hessian in σ0;
+    # otherwise the line search optimizes the wrong function and stalls for
+    # small epsilon while the true objective increases.
+    n = 20
+    rng = MersenneTwister(5)
+    obj = [2 + 40 * exp(-((i - 10)^2 + (j - 9)^2) / 6) for i in 1:n, j in 1:n]
+    psf = [exp(-((i - 1 - n ÷ 2)^2 + (j - 1 - n ÷ 2)^2) / 3) for i in 1:n, j in 1:n]
+    psf = ifftshift(psf ./ sum(psf))
+    measured = real.(ifft(fft(obj) .* fft(psf))) .+ 1 .+ 0.5 .* randn(rng, n, n)
+    measured = max.(measured, 0)
+    gamma, epsilon, weights = 0.05, 1e-2, (1.0, 0.7)
+    pairs, hw = DeconvOptim._mappr_hessian_pairs(2)
+    h = zeros(n, n)
+    function objective(o, m)
+        s = fill(epsilon^2, n, n)
+        for (k, (d, e)) in enumerate(pairs)
+            DeconvOptim._mappr_hessian!(h, o, d, e, weights)
+            s .+= hw[k] .* h .^ 2
+        end
+        mu = m .+ 1
+        return sum(mu .- measured .* log.(mu)) + gamma * sum(sqrt.(s))
+    end
+    for cg_update in (:fletcher_reeves, :polak_ribiere)
+        values = Float64[]
+        map_cj(measured, psf; penalty=:hessian_frobenius, gamma, epsilon,
+               weights, background=1.0, iterations=40, cg_update,
+               callback=(it, o, m) -> (push!(values, objective(o, m)); false))
+        @test all(diff(values) .<= 1e-9 .* abs.(values[1:end-1]))
+        @test values[end] < values[1] - 1
+    end
+    @test_throws ArgumentError map_cj(measured, psf; cg_update=:hestenes)
 end

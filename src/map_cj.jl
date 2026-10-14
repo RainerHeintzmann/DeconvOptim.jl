@@ -37,6 +37,9 @@ smoothed Frobenius norm of the Hessian of `x.^2`.
 - `background=0`: nonnegative Poisson background.
 - `iterations=60`: number of conjugate-gradient iterations.
 - `newton_iterations=3`: Newton sub-iterations in each line search.
+- `cg_update=:fletcher_reeves`: conjugate-gradient update, `:fletcher_reeves`
+  or `:polak_ribiere` (PR+, i.e. `beta = max(0, beta_PR)`, which restarts
+  automatically when successive gradients are nearly equal).
 - `saddle_escape=1.0`: strength of the saddle-escape term added to the search
   direction. With `object = x.^2` the gradient `2x .* g_f` vanishes at
   `x == 0` even where the object-space gradient `g_f` asks the voxel to grow;
@@ -76,6 +79,7 @@ function map_cj(measured::AbstractArray, psf::AbstractArray;
                background=0.0,
                iterations=60,
                newton_iterations=3,
+               cg_update=:fletcher_reeves,
                saddle_escape=1.0,
                escape_threshold=1e-4,
                initial=nothing,
@@ -94,6 +98,8 @@ function map_cj(measured::AbstractArray, psf::AbstractArray;
         throw(ArgumentError("`padding` must be finite"))
     penalty in (:good, :hessian_frobenius) ||
         throw(ArgumentError("`penalty` must be :good or :hessian_frobenius"))
+    cg_update in (:fletcher_reeves, :polak_ribiere) ||
+        throw(ArgumentError("`cg_update` must be :fletcher_reeves or :polak_ribiere"))
     loss in (:poisson, :anscombe) ||
         throw(ArgumentError("`loss` must be :poisson or :anscombe"))
     isfinite(anscombe_offset) && anscombe_offset > 0 ||
@@ -279,8 +285,11 @@ function map_cj(measured::AbstractArray, psf::AbstractArray;
         else
             denom = _map_cj_dot(previous_gradient, previous_gradient,
                                 dot_partials)
-            beta = iszero(denom) ? zero(T) :
-                   _map_cj_dot(gradient, gradient, dot_partials) / denom
+            numer = _map_cj_dot(gradient, gradient, dot_partials)
+            if cg_update === :polak_ribiere
+                numer -= _map_cj_dot(gradient, previous_gradient, dot_partials)
+            end
+            beta = iszero(denom) ? zero(T) : max(zero(T), T(numer / denom))
             @. direction = beta * direction - gradient
             if _map_cj_dot(gradient, direction, dot_partials) >= 0
                 @. direction = -gradient
@@ -297,23 +306,11 @@ function map_cj(measured::AbstractArray, psf::AbstractArray;
         _mappr_convolve!(m2, direction_sq, direction, direction, convolve, otf)
 
         if penalty === :hessian_frobenius
-            @. cross_term = 2 * x * direction
-            @. direction_sq = abs2(direction)
-            fill!(sigma[1], T(eps_hessian)^2)
-            for j in 2:5
-                fill!(sigma[j], zero(T))
-            end
-            for k in eachindex(hessian_a)
-                d, e = hessian_pairs[k]
-                _mappr_hessian!(hessian_b, cross_term, d, e, dim_weights)
-                _mappr_hessian!(hessian_c, direction_sq, d, e, dim_weights)
-                a = hessian_a[k]
-                w = hessian_weights[k]
-                @. sigma[2] += 2 * w * a * hessian_b
-                @. sigma[3] += w * (hessian_b * hessian_b + 2 * a * hessian_c)
-                @. sigma[4] += 2 * w * hessian_b * hessian_c
-                @. sigma[5] += w * hessian_c * hessian_c
-            end
+            _mappr_frobenius_coefficients!(sigma, hessian_a, x, direction,
+                                           cross_term, direction_sq,
+                                           hessian_b, hessian_c, hessian_pairs,
+                                           hessian_weights, dim_weights,
+                                           T(eps_hessian))
         end
 
         if penalty === :good
@@ -378,6 +375,33 @@ function _mappr_saddle_escape!(direction, x, object, g_f, pull, strength,
     scale = strength * rms_direction
     @. direction += ifelse(x < 0, -scale, scale) * sqrt(pull / max_pull)
     return direction
+end
+
+# Coefficients of the quartic s(α) = ε² + Σ_k w_k [D_k (x + αd)²]² per voxel,
+# given the cached a_k = D_k x².
+function _mappr_frobenius_coefficients!(sigma, hessian_a, x, direction,
+                                        cross_term, direction_sq, hessian_b,
+                                        hessian_c, hessian_pairs,
+                                        hessian_weights, dim_weights, epsilon)
+    @. cross_term = 2 * x * direction
+    @. direction_sq = abs2(direction)
+    fill!(sigma[1], epsilon^2)
+    for j in 2:5
+        fill!(sigma[j], zero(eltype(x)))
+    end
+    for k in eachindex(hessian_a)
+        d, e = hessian_pairs[k]
+        _mappr_hessian!(hessian_b, cross_term, d, e, dim_weights)
+        _mappr_hessian!(hessian_c, direction_sq, d, e, dim_weights)
+        a = hessian_a[k]
+        w = hessian_weights[k]
+        @. sigma[1] += w * a * a
+        @. sigma[2] += 2 * w * a * hessian_b
+        @. sigma[3] += w * (hessian_b * hessian_b + 2 * a * hessian_c)
+        @. sigma[4] += 2 * w * hessian_b * hessian_c
+        @. sigma[5] += w * hessian_c * hessian_c
+    end
+    return sigma
 end
 
 function _mappr_convolve!(out, tmp, x, d, convolve, otf)
