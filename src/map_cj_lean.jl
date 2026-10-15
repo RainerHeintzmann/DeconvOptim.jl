@@ -210,20 +210,18 @@ function _lean_setup(measured, psf; penalty, loss, anscombe_offset, mapping,
         throw(ArgumentError("`background` must be nonnegative and finite"))
 
     T = promote_type(float(eltype(measured)), float(eltype(psf)))
-    measured_data = T.(measured)
-    any((.!isfinite.(measured_data)) .| (measured_data .< zero(T))) &&
+    # validation without temporary Bool arrays
+    mapreduce(v -> isfinite(v) & (v >= 0), &, measured; init=true) ||
         throw(ArgumentError("measurements must be nonnegative and finite"))
-    psf_data = T.(psf)
-    any(.!isfinite.(psf_data)) &&
+    mapreduce(isfinite, &, psf; init=true) ||
         throw(ArgumentError("`psf` must contain only finite values"))
     conv_dims = Tuple(Int.(collect(conv_dims)))
     all(d -> 1 <= d <= N, conv_dims) ||
         throw(ArgumentError("`conv_dims` contains a dimension outside 1:$N"))
+    psf_sum = T(sum(psf))
     if normalize_psf
-        psf_sum = sum(psf_data)
         isfinite(psf_sum) && psf_sum > 0 ||
             throw(ArgumentError("`psf` must have a positive finite sum when normalized"))
-        psf_data ./= psf_sum
     end
 
     size_padded = ntuple(N) do d
@@ -235,30 +233,46 @@ function _lean_setup(measured, psf; penalty, loss, anscombe_offset, mapping,
         end
     end
     padded = any(size_padded[d] != size(measured, d) for d in 1:N)
-    data = similar(measured_data, T, size_padded)
-    fill!(data, zero(T))
+    # `measured` is only read, so it is used directly when no conversion or
+    # padding is needed
+    measured_data = eltype(measured) === T ? measured : T.(measured)
+    mean_level = max(T(mean(measured_data)) - T(background), eps(T))
     mask = nothing
     if padded
+        data = similar(measured_data, T, size_padded)
+        fill!(data, zero(T))
         center_set!(data, measured_data)
         mask = similar(data)
         fill!(mask, zero(T))
         measured_mask = similar(measured_data)
         fill!(measured_mask, one(T))
         center_set!(mask, measured_mask)
+        _lean_free!(measured_mask)
+        measured_data === measured || _lean_free!(measured_data)
     else
-        copyto!(data, measured_data)
+        data = measured_data
     end
 
-    # OTF and an in-place convolution sharing one FFT buffer
-    work = similar(data)
-    fill!(work, zero(T))
-    center_set!(work, fftshift(psf_data, conv_dims))
-    work = ifftshift(work, conv_dims)
-    P = get_plan(T)(work, conv_dims)
-    ft = P * work
-    otf = copy(ft)
+    # OTF and an in-place convolution sharing one FFT buffer. A PSF of the
+    # padded size is used as is (it is centred at its first entry); a smaller
+    # one is embedded first. Normalization is applied to the OTF.
+    if size(psf) == size_padded
+        psf_full = eltype(psf) === T ? psf : T.(psf)
+    else
+        psf_small = fftshift(T.(psf), conv_dims)
+        work = similar(data)
+        fill!(work, zero(T))
+        center_set!(work, psf_small)
+        _lean_free!(psf_small)
+        psf_full = ifftshift(work, conv_dims)
+        _lean_free!(work)
+    end
+    P = get_plan(T)(psf_full, conv_dims)
+    otf = P * psf_full
+    normalize_psf && (otf ./= psf_sum)
+    psf_full === psf || _lean_free!(psf_full)
+    ft = similar(otf)
     P_inv = inv(P)
-    work = nothing
     conv! = (dst, src, adjoint) -> begin
         mul!(ft, P, src)
         if adjoint
@@ -282,7 +296,6 @@ function _lean_setup(measured, psf; penalty, loss, anscombe_offset, mapping,
     pair_list, pair_weights = _mappr_hessian_pairs(N)
 
     x = similar(data)
-    mean_level = max(mean(measured_data) - T(background), eps(T))
     if initial === nothing
         fill!(x, _finv(m, mean_level))
     elseif initial isa Number
@@ -290,18 +303,20 @@ function _lean_setup(measured, psf; penalty, loss, anscombe_offset, mapping,
             throw(ArgumentError("`initial` must be nonnegative and finite"))
         fill!(x, _finv(m, T(initial)))
     else
-        size(initial) == size(measured_data) || size(initial) == size(data) ||
+        size(initial) == size(measured) || size(initial) == size(data) ||
             throw(ArgumentError("array-valued `initial` must have the measured or padded size"))
-        any((.!isfinite.(initial)) .| (initial .< 0)) &&
+        mapreduce(v -> isfinite(v) & (v >= 0), &, initial; init=true) ||
             throw(ArgumentError("`initial` must be nonnegative and finite"))
-        initial_data = similar(data, T, size(initial))
-        copyto!(initial_data, initial)
-        @. initial_data = _finv(m, initial_data)
-        if size(initial_data) == size(data)
-            copyto!(x, initial_data)
+        if size(initial) == size(data)
+            copyto!(x, initial)
+            @. x = _finv(m, x)
         else
+            initial_data = similar(data, T, size(initial))
+            copyto!(initial_data, initial)
+            @. initial_data = _finv(m, initial_data)
             fill!(x, _finv(m, mean_level))
             center_set!(x, initial_data)
+            _lean_free!(initial_data)
         end
     end
 
@@ -309,11 +324,15 @@ function _lean_setup(measured, psf; penalty, loss, anscombe_offset, mapping,
          offset=T(anscombe_offset), mapping=m, penalty=penalty, gamma=T(gamma),
          eps2=eps_hessian^2, weights=dim_weights, pairs=Tuple(pair_list),
          pair_weights=Tuple(T.(pair_weights)), conv! = conv!, padded=padded,
-         crop=padding > 0, measured_size=size(measured_data))
+         crop=padding > 0, measured_size=size(measured))
     return c, x
 end
 
 _lean_mask(c) = c.mask === nothing ? one(eltype(c.data)) : c.mask
+
+# releases a temporary right away (GPU arrays are otherwise only freed by the
+# garbage collector); a no-op for CPU arrays
+_lean_free!(a) = (finalize(a); nothing)
 
 function _lean_model!(c, mu, x)
     m = c.mapping

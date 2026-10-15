@@ -125,3 +125,23 @@ end
     @test all(iszero, stuck[3:11, 2:10])
     @test sum(abs2, freed .- obj) < 0.5 * sum(abs2, stuck .- obj)
 end
+
+@testset "MAP-CJ lean leaves its inputs untouched" begin
+    obj, psf, measured, _ = _lean_test_problem((16, 15); seed=6)
+    small_psf = fftshift(psf)[5:12, 4:11]   # centred, smaller than the data
+    for (meas, p) in ((measured, psf), (Float32.(measured), psf),
+                      (measured, ifftshift(small_psf)), (measured, 3 .* psf))
+        meas_copy, p_copy = copy(meas), copy(p)
+        for padding in (0.0, 0.2)
+            result = map_cj_lean(meas, p; penalty=:hessian_frobenius, gamma=1e-3,
+                                 epsilon=1.0, background=1.0, iterations=5, padding)
+            @test all(isfinite, result)
+            @test meas == meas_copy
+            @test p == p_copy
+        end
+    end
+    # PSF normalization on the OTF: a scaled PSF gives the same result
+    a = map_cj_lean(measured, psf; iterations=5, background=1.0)
+    b = map_cj_lean(measured, 3 .* psf; iterations=5, background=1.0)
+    @test a ≈ b
+end
