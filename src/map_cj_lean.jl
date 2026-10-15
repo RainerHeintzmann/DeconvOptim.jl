@@ -15,7 +15,9 @@ from the OTF and the FFT buffer, only six full-size arrays are used (data,
 `x`, blurred object, gradient, search direction and one work array), plus a
 mask when padding. Each iteration costs three convolutions (`H(f'(x) d)`,
 `H f(x_new)` and the adjoint for the gradient) and one more per backtracking
-step.
+step. `measured` and `psf` are not modified. The PSF may stay on the CPU when
+`measured` is on the GPU: the OTF is then computed on the CPU and only the OTF
+is copied to the GPU, which saves one volume of GPU memory.
 
 # Keyword arguments
 - `penalty=:good`: `:good` or `:hessian_frobenius`. `:good` is Good's
@@ -255,20 +257,32 @@ function _lean_setup(measured, psf; penalty, loss, anscombe_offset, mapping,
 
     # OTF and an in-place convolution sharing one FFT buffer. A PSF of the
     # padded size is used as is (it is centred at its first entry); a smaller
-    # one is embedded first. Normalization is applied to the OTF.
+    # one is embedded first. Normalization is applied to the OTF. A PSF that
+    # lives on another device than the data (e.g. on the CPU for GPU data) is
+    # transformed there, and only the OTF is copied to the data's device.
     if size(psf) == size_padded
         psf_full = eltype(psf) === T ? psf : T.(psf)
     else
         psf_small = fftshift(T.(psf), conv_dims)
-        work = similar(data)
+        work = similar(psf_small, T, size_padded)
         fill!(work, zero(T))
         center_set!(work, psf_small)
         _lean_free!(psf_small)
         psf_full = ifftshift(work, conv_dims)
         _lean_free!(work)
     end
-    P = get_plan(T)(psf_full, conv_dims)
-    otf = P * psf_full
+    same_device = KernelAbstractions.get_backend(psf_full) ==
+                  KernelAbstractions.get_backend(data)
+    if same_device
+        P = get_plan(T)(psf_full, conv_dims)
+        otf = P * psf_full
+    else
+        otf_host = get_plan(T)(psf_full, conv_dims) * psf_full
+        otf = similar(data, eltype(otf_host), size(otf_host))
+        copyto!(otf, otf_host)
+        otf_host = nothing
+        P = get_plan(T)(data, conv_dims)
+    end
     normalize_psf && (otf ./= psf_sum)
     psf_full === psf || _lean_free!(psf_full)
     ft = similar(otf)

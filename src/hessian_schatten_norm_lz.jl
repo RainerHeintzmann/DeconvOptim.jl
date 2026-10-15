@@ -31,8 +31,9 @@ pixel-wise Hessian are inverted in closed form for speed, `sum_dims` is
 limited to exactly two dimensions; passing more throws an `ArgumentError`.
 
 `weights[k]` pair positionally with `sum_dims[k]`: the diagonal Hessian entry
-of dimension `d` enters with `weights[k]^2` and the cross entry between the
-two dimensions enters with `2 * weights[k] * weights[l]`.
+of dimension `d` is scaled by `weights[k]` and the mixed entry by
+`sqrt(weights[k] * weights[l])` -- the same convention as `TH` (and `GR`,
+`TV`, `Tikhonov`): for sampling distances `S_k` use `weights[k] = 1 / S_k^2`.
 
 The pixel-wise Hessian uses centered (symmetric) second-order stencils, so the
 norm has no preferred direction. The computation is regularized by an internal
@@ -115,11 +116,14 @@ function HS_generic(arr, p, sum_dims, weights)
     H11 = hs_diag(arr, d1, (d1, d2))
     H22 = hs_diag(arr, d2, (d1, d2))
     H12 = hs_cross(arr, d1, d2)
-    w1sq = w[1] * w[1]
-    w2sq = w[2] * w[2]
-    w12  = w[1] * w[2]
-    a = @~ w1sq .* H11
-    d = @~ w2sq .* H22
+    # weights of the Hessian entries (same convention as TH): the diagonal entry
+    # (d,d) is scaled by w[d] and the mixed entry by sqrt(w[1] * w[2]), so
+    # sampling distances S correspond to w = 1 / S^2.
+    w11 = w[1]
+    w22 = w[2]
+    w12  = sqrt(w[1] * w[2])
+    a = @~ w11 .* H11
+    d = @~ w22 .* H22
     b = @~ w12 .* H12
     λ1, λ2 = hs_eigvals(a, b, d)
     if isone(p)
@@ -256,9 +260,12 @@ end
 function hs_gradient(arr, p, sum_dims, weights)
     d1, d2 = hs_validate_sum_dims(arr, sum_dims)
     w = hs_weights(weights)
-    w1sq = w[1] * w[1]
-    w2sq = w[2] * w[2]
-    w12  = w[1] * w[2]
+    # weights of the Hessian entries (same convention as TH): the diagonal entry
+    # (d,d) is scaled by w[d] and the mixed entry by sqrt(w[1] * w[2]), so
+    # sampling distances S correspond to w = 1 / S^2.
+    w11 = w[1]
+    w22 = w[2]
+    w12  = sqrt(w[1] * w[2])
     T = float(eltype(arr))
     eps = T(1e-8)
     h05 = T(0.5)
@@ -275,8 +282,8 @@ function hs_gradient(arr, p, sum_dims, weights)
     # eigenvalues, same closed form as the forward pass (`hs_eigvals`):
     #   λ1 = 0.5(tr+B), λ2 = 0.5(tr-B), tr = w1²H11 + w2²H22,
     #   B   = sqrt(eps + (w1²H11 - w2²H22)² + 4 (w1 w2 H12)²)
-    diff = w1sq .* h11 .- w2sq .* h22
-    tr = w1sq .* h11 .+ w2sq .* h22
+    diff = w11 .* h11 .- w22 .* h22
+    tr = w11 .* h11 .+ w22 .* h22
     B = sqrt.(eps .+ diff .^ htwo .+ hfour .* (w12 .* h12) .^ htwo)
 
     # derivative of the per-pixel loss w.r.t. the eigenvalues
@@ -304,12 +311,12 @@ function hs_gradient(arr, p, sum_dims, weights)
     gr = fill!(similar(arr, Tg), zero(Tg))
     rs = hs_ranges(arr, (d1, d2))
     # in-place fused accumulation (`.+=` on a SubArray would materialize a temp)
-    hs_acc!(gr, rs, T(-2) .* w1sq .* da)
-    hs_acc!(gr, hs_offs(rs, Dict(d1 => -1)), w1sq .* da)
-    hs_acc!(gr, hs_offs(rs, Dict(d1 => 1)), w1sq .* da)
-    hs_acc!(gr, rs, T(-2) .* w2sq .* dd)
-    hs_acc!(gr, hs_offs(rs, Dict(d2 => -1)), w2sq .* dd)
-    hs_acc!(gr, hs_offs(rs, Dict(d2 => 1)), w2sq .* dd)
+    hs_acc!(gr, rs, T(-2) .* w11 .* da)
+    hs_acc!(gr, hs_offs(rs, Dict(d1 => -1)), w11 .* da)
+    hs_acc!(gr, hs_offs(rs, Dict(d1 => 1)), w11 .* da)
+    hs_acc!(gr, rs, T(-2) .* w22 .* dd)
+    hs_acc!(gr, hs_offs(rs, Dict(d2 => -1)), w22 .* dd)
+    hs_acc!(gr, hs_offs(rs, Dict(d2 => 1)), w22 .* dd)
     c4 = hq .* w12
     hs_acc!(gr, hs_offs(rs, Dict(d1 => 1, d2 => 1)), c4 .* db)
     hs_acc!(gr, hs_offs(rs, Dict(d1 => -1, d2 => 1)), -c4 .* db)
