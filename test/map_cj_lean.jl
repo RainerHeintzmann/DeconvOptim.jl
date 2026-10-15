@@ -145,3 +145,33 @@ end
     b = map_cj_lean(measured, 3 .* psf; iterations=5, background=1.0)
     @test a ≈ b
 end
+
+@testset "MAP-CJ lean padding border is masked" begin
+    obj, psf, measured, rng = _lean_test_problem((14, 13); seed=8)
+    for loss in (:poisson, :anscombe)
+        c, x = DeconvOptim._lean_setup(measured, psf; penalty=:hessian_frobenius,
+            loss, anscombe_offset=3 / 8, mapping=:square, mapping_scale=1.0,
+            gamma=0.0, epsilon=0.5, weights=nothing, background=1.0,
+            initial=nothing, conv_dims=1:2, normalize_psf=true, padding=0.3)
+        @test size(c.data) != size(measured)
+        x .= 1 .+ rand(rng, size(x)...)
+        mu, grad, tmp = similar(x), similar(x), similar(x)
+        DeconvOptim._lean_model!(c, mu, x)
+        inner = DeconvOptim.center_extract(mu, size(measured))
+        direct = loss === :poisson ?
+            sum(@. (inner + 1) - measured * log(inner + 1)) :
+            sum(@. abs2(sqrt(inner + 1 + 3 / 8) - sqrt(measured + 3 / 8)))
+        @test DeconvOptim._lean_objective(c, x, mu, tmp) ≈ direct
+        d = 0.1 .* randn(rng, size(x)...)
+        phi(a) = (xa = x .+ a .* d; DeconvOptim._lean_model!(c, mu, xa);
+                  DeconvOptim._lean_objective(c, xa, mu, tmp))
+        DeconvOptim._lean_model!(c, mu, x)
+        DeconvOptim._lean_gradient!(c, grad, tmp, x, mu)
+        d1 = dot(grad, d)
+        d2 = DeconvOptim._lean_curvature!(c, tmp, x, d, mu)
+        h = 1e-4
+        p0, pp, pm = phi(0.0), phi(h), phi(-h)
+        @test d1 ≈ (pp - pm) / (2h) rtol=1e-5
+        @test d2 ≈ (pp - 2p0 + pm) / h^2 rtol=1e-3
+    end
+end

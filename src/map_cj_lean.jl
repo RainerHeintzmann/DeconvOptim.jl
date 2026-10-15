@@ -11,9 +11,9 @@ Instead of caching polynomial line-search coefficients, the step length is
 `α = -φ'(0)/φ''(0)` with the exact first and second directional derivatives
 at `α = 0`, followed by Armijo backtracking. The regularizer terms are
 recomputed on the fly by fused stencil kernels instead of being stored. Apart
-from the OTF and the FFT buffer, only six full-size arrays are used (data,
-`x`, blurred object, gradient, search direction and one work array), plus a
-mask when padding. Each iteration costs three convolutions (`H(f'(x) d)`,
+from the OTF and the FFT buffer, only five full-size arrays are allocated
+(`x`, blurred object, gradient, search direction and one work array), plus a
+padded copy of the data when padding; otherwise `measured` is used directly. Each iteration costs three convolutions (`H(f'(x) d)`,
 `H f(x_new)` and the adjoint for the gradient) and one more per backtracking
 step. `measured` and `psf` are not modified. The PSF may stay on the CPU when
 `measured` is on the GPU: the OTF is then computed on the CPU and only the OTF
@@ -239,17 +239,12 @@ function _lean_setup(measured, psf; penalty, loss, anscombe_offset, mapping,
     # padding is needed
     measured_data = eltype(measured) === T ? measured : T.(measured)
     mean_level = max(T(mean(measured_data)) - T(background), eps(T))
-    mask = nothing
     if padded
+        # The padding border is marked by -1 (measurements are nonnegative),
+        # so the data mask `data >= 0` needs no array of its own.
         data = similar(measured_data, T, size_padded)
-        fill!(data, zero(T))
+        fill!(data, -one(T))
         center_set!(data, measured_data)
-        mask = similar(data)
-        fill!(mask, zero(T))
-        measured_mask = similar(measured_data)
-        fill!(measured_mask, one(T))
-        center_set!(mask, measured_mask)
-        _lean_free!(measured_mask)
         measured_data === measured || _lean_free!(measured_data)
     else
         data = measured_data
@@ -334,7 +329,7 @@ function _lean_setup(measured, psf; penalty, loss, anscombe_offset, mapping,
         end
     end
 
-    c = (data=data, mask=mask, background=T(background), loss=loss,
+    c = (data=data, background=T(background), loss=loss,
          offset=T(anscombe_offset), mapping=m, penalty=penalty, gamma=T(gamma),
          eps2=eps_hessian^2, weights=dim_weights, pairs=Tuple(pair_list),
          pair_weights=Tuple(T.(pair_weights)), conv! = conv!, padded=padded,
@@ -342,7 +337,10 @@ function _lean_setup(measured, psf; penalty, loss, anscombe_offset, mapping,
     return c, x
 end
 
-_lean_mask(c) = c.mask === nothing ? one(eltype(c.data)) : c.mask
+# data-term contributions are zero in the padding border, where data == -1;
+# `max(g, 0)` keeps the masked-out evaluation finite (sqrt in :anscombe)
+@inline _lean_masked(f, L, u, g, b, o) =
+    ifelse(g >= zero(g), f(L, u, max(g, zero(g)), b, o), zero(u))
 
 # releases a temporary right away (GPU arrays are otherwise only freed by the
 # garbage collector); a no-op for CPU arrays
@@ -377,8 +375,8 @@ end
 function _lean_objective(c, x, mu, tmp)
     L = Val(c.loss)
     b, o = c.background, c.offset
-    data_term = sum(_lazy((mk, u, g) -> mk * _lean_loss(L, u, g, b, o),
-                          _lean_mask(c), mu, c.data))
+    data_term = sum(_lazy((u, g) -> _lean_masked(_lean_loss, L, u, g, b, o),
+                          mu, c.data))
     iszero(c.gamma) && return data_term
     _lean_penalty_value!(c, tmp, x)
     return data_term + c.gamma * sum(tmp)
@@ -389,8 +387,8 @@ end
 function _lean_gradient!(c, gradient, tmp, x, mu)
     L = Val(c.loss)
     m = c.mapping
-    b, o, mk, g = c.background, c.offset, _lean_mask(c), c.data
-    @. tmp = mk * _lean_residual(L, mu, g, b, o)
+    b, o, g = c.background, c.offset, c.data
+    @. tmp = _lean_masked(_lean_residual, L, mu, g, b, o)
     c.conv!(tmp, tmp, true)
     if c.penalty === :hessian_frobenius && !iszero(c.gamma)
         # `gradient` is free here: it holds r = sqrt(ε² + Σ w h²) for the adjoint
@@ -415,8 +413,8 @@ function _lean_curvature!(c, tmp, x, d, mu)
     @. tmp = _df(m, x) * d
     c.conv!(tmp, tmp, false)
     b, o = c.background, c.offset
-    curvature += sum(_lazy((mk, h, u, g) -> mk * _lean_loss2(L, u, g, b, o) * h * h,
-                           _lean_mask(c), tmp, mu, c.data))
+    curvature += sum(_lazy((h, u, g) -> _lean_masked(_lean_loss2, L, u, g, b, o) * h * h,
+                           tmp, mu, c.data))
     if !iszero(c.gamma)
         if c.penalty === :hessian_frobenius
             _lean_launch!(_lean_hf_curv_kernel!, tmp, x, d, m, c.pairs,
