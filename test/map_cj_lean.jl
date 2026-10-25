@@ -62,7 +62,7 @@ end
     obj, psf, measured, rng = _lean_test_problem()
     for mapping in (:square, :continuous_positive),
         penalty in (:good, :hessian_frobenius),
-        loss in (:poisson, :anscombe)
+        loss in (:poisson, :anscombe, :gauss)
 
         c, x = DeconvOptim._lean_setup(measured, psf; penalty, loss,
             anscombe_offset=3 / 8, mapping, mapping_scale=1.3, gamma=0.3,
@@ -148,7 +148,7 @@ end
 
 @testset "MAP-CJ lean padding border is masked" begin
     obj, psf, measured, rng = _lean_test_problem((14, 13); seed=8)
-    for loss in (:poisson, :anscombe)
+    for loss in (:poisson, :anscombe, :gauss)
         c, x = DeconvOptim._lean_setup(measured, psf; penalty=:hessian_frobenius,
             loss, anscombe_offset=3 / 8, mapping=:square, mapping_scale=1.0,
             gamma=0.0, epsilon=0.5, weights=nothing, background=1.0,
@@ -160,7 +160,9 @@ end
         inner = DeconvOptim.center_extract(mu, size(measured))
         direct = loss === :poisson ?
             sum(@. (inner + 1) - measured * log(inner + 1)) :
-            sum(@. abs2(sqrt(inner + 1 + 3 / 8) - sqrt(measured + 3 / 8)))
+            loss === :anscombe ?
+            sum(@. abs2(sqrt(inner + 1 + 3 / 8) - sqrt(measured + 3 / 8))) :
+            sum(@. abs2(inner + 1 - measured))
         @test DeconvOptim._lean_objective(c, x, mu, tmp) ≈ direct
         d = 0.1 .* randn(rng, size(x)...)
         phi(a) = (xa = x .+ a .* d; DeconvOptim._lean_model!(c, mu, xa);

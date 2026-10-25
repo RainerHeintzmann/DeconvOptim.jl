@@ -25,8 +25,9 @@ is copied to the GPU, which saves one volume of GPU memory.
   where `u = x` for `mapping=:square` (MAPPR's `-4 xᵀLx`) and `u = sqrt(f)`
   otherwise. `:hessian_frobenius` is `Σ sqrt(epsilon^2 + ||Hessian(f)||_F^2)`
   with the same weighted stencils as `map_cj`.
-- `loss=:poisson`: data term, `:poisson` or `:anscombe`
-  (`Σ (sqrt(μ + β) - sqrt(measured + β))^2`).
+- `loss=:poisson`: data term, `:poisson`, `:anscombe`
+  (`Σ (sqrt(μ + β) - sqrt(measured + β))^2`) or `:gauss`
+  (`Σ (μ - measured)^2`, the variance absorbed in `gamma`).
 - `anscombe_offset=3/8`: `β` of the `:anscombe` loss, in measured counts.
 - `mapping=:square`: `:square` (`f = x^2`) or `:continuous_positive`
   (`f = x + sqrt(x^2 + 4 mapping_scale^2)`, strictly positive with `f' > 0`,
@@ -198,8 +199,8 @@ function _lean_setup(measured, psf; penalty, loss, anscombe_offset, mapping,
         throw(ArgumentError("`padding` must be finite"))
     penalty in (:good, :hessian_frobenius) ||
         throw(ArgumentError("`penalty` must be :good or :hessian_frobenius"))
-    loss in (:poisson, :anscombe) ||
-        throw(ArgumentError("`loss` must be :poisson or :anscombe"))
+    loss in (:poisson, :anscombe, :gauss) ||
+        throw(ArgumentError("`loss` must be :poisson, :anscombe or :gauss"))
     mapping in (:square, :continuous_positive) ||
         throw(ArgumentError("`mapping` must be :square or :continuous_positive"))
     isfinite(mapping_scale) && mapping_scale > 0 ||
@@ -371,6 +372,12 @@ end
     M = max(mu + b, zero(mu)) + offset
     return sqrt(g + offset) / (2 * M * sqrt(M))
 end
+
+# Gaussian noise: Σ (μ + b - g)^2, the data term of MAPGR (Verveer and Jovin)
+# and of MAPGH (with the Hessian penalty)
+@inline _lean_loss(::Val{:gauss}, mu, g, b, offset) = abs2(mu + b - g)
+@inline _lean_residual(::Val{:gauss}, mu, g, b, offset) = 2 * (mu + b - g)
+@inline _lean_loss2(::Val{:gauss}, mu, g, b, offset) = 2 * one(mu)
 
 function _lean_objective(c, x, mu, tmp)
     L = Val(c.loss)
