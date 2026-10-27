@@ -314,3 +314,21 @@ end
     @test_throws ArgumentError TH(sum_dims=[4])(x3)
     @test_throws ArgumentError DeconvOptim.TH_cuda(num_dims=2, sum_dims=[3])(x2)
 end
+
+# The Tullio kernels are empty on an axis of length 1, which used to make GR / TV / Tikhonov / TH
+# exactly zero (value and gradient) for a single plane [x, y, 1]; the constructors now apply the
+# 2-D version to such a plane.
+@testset "singleton third dimension" begin
+    x2 = rand(Float32, 16, 16)
+    x1 = reshape(copy(x2), 16, 16, 1)
+    for ctor in (GR, TV, Tikhonov, TH)
+        for kw in ((;), (; num_dims=3), (; num_dims=3, sum_dims=[1, 2, 3], weights=[1.0, 1.0, 1.0]))
+            reg3 = ctor(; kw...)
+            reg2 = ctor(; num_dims=2)
+            @test Base.invokelatest(reg3, x1) > 0
+            @test isapprox(Base.invokelatest(reg3, x1), Base.invokelatest(reg2, x2); rtol=1e-5)
+            g = Base.invokelatest(DeconvOptim.gradient, reg3, x1)[1]
+            @test size(g) == size(x1) && sum(abs, g) > 0
+        end
+    end
+end

@@ -149,6 +149,28 @@ function make_tikhonov_closure(num_dims, s_dims, ws, step, mode)
     end
 end
 
+# ---- singleton guard ---------------------------------------------------
+# The Tullio kernels of GR / TV / Tikhonov / TH only sum over index values for which *every*
+# shifted access `x[..., k+1]`, `x[..., k-1]` is in bounds. On an axis of length 1 (e.g. a
+# single z-plane `[x, y, 1]` of a 3-D pipeline) that range is empty, so the whole regularizer —
+# value and gradient — is exactly zero and silently does nothing. For such arrays the 2-D
+# version (`ctor` called with `num_dims=2`) is applied to the plane instead.
+function _plane_guarded(ctor, f3; num_dims, sum_dims, weights, kwargs...)
+    (isnothing(num_dims) || num_dims == 3) || return f3
+    sd2 = isnothing(sum_dims) ? nothing : [d for d in sum_dims if d <= 2]
+    (sd2 !== nothing && isempty(sd2)) && return f3
+    # `weights` pair positionally with `sum_dims` when given, else with the dimensions
+    w2 = if isnothing(weights)
+        nothing
+    elseif isnothing(sum_dims)
+        length(weights) >= 2 ? weights[1:2] : weights
+    else
+        [w for (d, w) in zip(sum_dims, weights) if d <= 2]
+    end
+    f2 = ctor(; num_dims=(isnothing(num_dims) ? nothing : 2), sum_dims=sd2, weights=w2, _guard=false, kwargs...)
+    return arr -> (ndims(arr) == 3 && size(arr, 3) == 1) ? f2(dropdims(arr; dims=3)) : f3(arr)
+end
+
 """
     Tikhonov(; <keyword arguments>)
 
@@ -174,7 +196,11 @@ julia> reg([1 2 3; 4 5 6; 7 8 9])
 285
 ```
 """
-function Tikhonov(; num_dims=nothing, sum_dims=nothing, weights=nothing, step=1, mode="laplace")
+function Tikhonov(; num_dims=nothing, sum_dims=nothing, weights=nothing, step=1, mode="laplace", _guard=true)
+    if _guard
+        return _plane_guarded(Tikhonov, Tikhonov(; num_dims, sum_dims, weights, step, mode, _guard=false);
+                              num_dims, sum_dims, weights, step, mode)
+    end
     if mode == "identity"
         return arr -> sum(abs2.(arr))
     elseif !(mode in ("laplace", "spatial_grad_square"))
@@ -286,7 +312,11 @@ julia> reg([1 2 3; 4 5 6; 7 8 9])
 ```
 """
 function GR(; num_dims=nothing, sum_dims=nothing, weights=nothing, step=1,
-              mode="forward", ϵ=1f-8)
+              mode="forward", ϵ=1f-8, _guard=true)
+    if _guard
+        return _plane_guarded(GR, GR(; num_dims, sum_dims, weights, step, mode, ϵ, _guard=false);
+                              num_dims, sum_dims, weights, step, mode, ϵ)
+    end
     if !(mode in ("forward", "central"))
         throw(ArgumentError("The provided mode is not valid."))
     end
@@ -414,7 +444,11 @@ julia> reg([1 2 3; 4 5 6; 7 8 9])
 12.649111f0
 ```
 """
-function TV(; num_dims=nothing, sum_dims=nothing, weights=nothing, step=1, mode="forward", ϵ=1f-8)
+function TV(; num_dims=nothing, sum_dims=nothing, weights=nothing, step=1, mode="forward", ϵ=1f-8, _guard=true)
+    if _guard
+        return _plane_guarded(TV, TV(; num_dims, sum_dims, weights, step, mode, ϵ, _guard=false);
+                              num_dims, sum_dims, weights, step, mode, ϵ)
+    end
     if !(mode in ("forward", "central"))
         throw(ArgumentError("The provided mode is not valid."))
     end
@@ -483,7 +517,11 @@ of a n-dimensional array.
     the pure Hessian norm `sqrt.(H²)`, while a larger `ϵ` smooths the
     transition (compare with `TV`, where `ϵ` plays the same role).
 """
-function TH(; num_dims=nothing, sum_dims=nothing, weights=nothing, ϵ=1f-8)
+function TH(; num_dims=nothing, sum_dims=nothing, weights=nothing, ϵ=1f-8, _guard=true)
+    if _guard
+        return _plane_guarded(TH, TH(; num_dims, sum_dims, weights, ϵ, _guard=false);
+                              num_dims, sum_dims, weights, ϵ)
+    end
     if isnothing(num_dims)
         if isnothing(sum_dims)
             # automatic selection of `num_dims` based on the array upon use
