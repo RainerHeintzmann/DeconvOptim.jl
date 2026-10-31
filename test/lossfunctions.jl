@@ -24,6 +24,26 @@ end
 end
 
 
+@testset "Weighted Gaussian Loss" begin
+    N = 6
+    img = abs.(randn((N, N)))
+    meas = abs.(randn((N, N)))
+    ω = 0.1 .+ rand(N, N)
+
+    wg = WeightedGauss(ω)
+    @test wg(img, meas) ≈ sum(ω .* abs2.(img .- meas))
+    @test 0 ≈ wg(img, img)
+    # unit weights reproduce the plain Gaussian loss
+    @test WeightedGauss(ones(N, N))(img, meas) ≈ gauss_aux(img, meas)
+
+    @test Zygote.gradient(im -> wg(im, meas), img)[1] ≈ 2 .* ω .* (img .- meas)
+    @test Zygote.gradient(im -> weighted_gauss_aux(im, meas, ω), img)[1] ≈ 2 .* ω .* (img .- meas)
+
+    # a pixel with weight 0 does not contribute
+    ω0 = copy(ω); ω0[2, 2] = 0
+    @test all(Zygote.gradient(im -> WeightedGauss(ω0)(im, meas), img)[1][2, 2] .== 0)
+end
+
 @testset "Scaled Gauss" begin
     N = 6
     img = abs.(randn((N, N)))

@@ -41,6 +41,12 @@ is copied to the GPU, which saves one volume of GPU memory.
 - `iterations=60`: number of conjugate-gradient iterations.
 - `saddle_escape=1.0`, `escape_threshold=1e-4`: saddle escape for
   `mapping=:square`, see `map_cj`. Ignored for other mappings.
+- `noise_weights=nothing`: array of the size of `measured` with the nonnegative
+  per-pixel weights `ω` of the Gaussian data term `Σ ω (μ - measured)²`
+  (inverse noise variances; only valid with `loss=:gauss`). `nothing` means
+  `ω = 1`. Only the relative shape of `ω` matters for the minimizer, but
+  `gamma` is measured against the scale of `ω`, so normalize it (e.g. to
+  mean 1) to keep `gamma` comparable to the unweighted case.
 - `padding=0.0`, `initial=nothing`, `conv_dims`, `normalize_psf=true`,
   `callback=nothing`: as in `map_cj`.
 
@@ -63,6 +69,7 @@ function map_cj_lean(measured::AbstractArray, psf::AbstractArray;
                      conv_dims=1:ndims(measured),
                      normalize_psf=true,
                      padding=0.0,
+                     noise_weights=nothing,
                      callback=nothing)
     iterations isa Integer && iterations >= 0 ||
         throw(ArgumentError("`iterations` must be a nonnegative integer"))
@@ -72,7 +79,7 @@ function map_cj_lean(measured::AbstractArray, psf::AbstractArray;
         throw(ArgumentError("`escape_threshold` must be nonnegative and finite"))
     c, x = _lean_setup(measured, psf; penalty, loss, anscombe_offset, mapping,
                        mapping_scale, gamma, epsilon, weights, background,
-                       initial, conv_dims, normalize_psf, padding)
+                       initial, conv_dims, normalize_psf, padding, noise_weights)
     T = eltype(x)
     m = c.mapping
     mu = similar(x)
@@ -187,7 +194,8 @@ _lazy(f, args...) = Broadcast.instantiate(Broadcast.broadcasted(f, args...))
 
 function _lean_setup(measured, psf; penalty, loss, anscombe_offset, mapping,
                      mapping_scale, gamma, epsilon, weights, background,
-                     initial, conv_dims, normalize_psf, padding)
+                     initial, conv_dims, normalize_psf, padding,
+                     noise_weights=nothing)
     N = ndims(measured)
     eltype(measured) <: Real && eltype(psf) <: Real ||
         throw(ArgumentError("`measured` and `psf` must contain real-valued data"))
@@ -249,6 +257,25 @@ function _lean_setup(measured, psf; penalty, loss, anscombe_offset, mapping,
         measured_data === measured || _lean_free!(measured_data)
     else
         data = measured_data
+    end
+
+    # Per-pixel inverse-variance weights of the Gaussian data term (a scalar 1
+    # when absent, so the broadcasts need no special case). Zero in the border.
+    omega = one(T)
+    if noise_weights !== nothing
+        loss === :gauss ||
+            throw(ArgumentError("`noise_weights` require `loss=:gauss`"))
+        size(noise_weights) == size(measured) ||
+            throw(ArgumentError("`noise_weights` must have the size of `measured`"))
+        mapreduce(v -> isfinite(v) & (v >= 0), &, noise_weights; init=true) ||
+            throw(ArgumentError("`noise_weights` must be nonnegative and finite"))
+        omega = similar(data)
+        if padded
+            fill!(omega, zero(T))
+            center_set!(omega, T.(noise_weights))
+        else
+            copyto!(omega, noise_weights)
+        end
     end
 
     # OTF and an in-place convolution sharing one FFT buffer. A PSF of the
@@ -334,7 +361,7 @@ function _lean_setup(measured, psf; penalty, loss, anscombe_offset, mapping,
          offset=T(anscombe_offset), mapping=m, penalty=penalty, gamma=T(gamma),
          eps2=eps_hessian^2, weights=dim_weights, pairs=Tuple(pair_list),
          pair_weights=Tuple(T.(pair_weights)), conv! = conv!, padded=padded,
-         crop=padding > 0, measured_size=size(measured))
+         crop=padding > 0, measured_size=size(measured), noise_weights=omega)
     return c, x
 end
 
@@ -382,8 +409,8 @@ end
 function _lean_objective(c, x, mu, tmp)
     L = Val(c.loss)
     b, o = c.background, c.offset
-    data_term = sum(_lazy((u, g) -> _lean_masked(_lean_loss, L, u, g, b, o),
-                          mu, c.data))
+    data_term = sum(_lazy((u, g, w) -> w * _lean_masked(_lean_loss, L, u, g, b, o),
+                          mu, c.data, c.noise_weights))
     iszero(c.gamma) && return data_term
     _lean_penalty_value!(c, tmp, x)
     return data_term + c.gamma * sum(tmp)
@@ -394,8 +421,8 @@ end
 function _lean_gradient!(c, gradient, tmp, x, mu)
     L = Val(c.loss)
     m = c.mapping
-    b, o, g = c.background, c.offset, c.data
-    @. tmp = _lean_masked(_lean_residual, L, mu, g, b, o)
+    b, o, g, w = c.background, c.offset, c.data, c.noise_weights
+    @. tmp = w * _lean_masked(_lean_residual, L, mu, g, b, o)
     c.conv!(tmp, tmp, true)
     if c.penalty === :hessian_frobenius && !iszero(c.gamma)
         # `gradient` is free here: it holds r = sqrt(ε² + Σ w h²) for the adjoint
@@ -420,8 +447,8 @@ function _lean_curvature!(c, tmp, x, d, mu)
     @. tmp = _df(m, x) * d
     c.conv!(tmp, tmp, false)
     b, o = c.background, c.offset
-    curvature += sum(_lazy((h, u, g) -> _lean_masked(_lean_loss2, L, u, g, b, o) * h * h,
-                           tmp, mu, c.data))
+    curvature += sum(_lazy((h, u, g, w) -> w * _lean_masked(_lean_loss2, L, u, g, b, o) * h * h,
+                           tmp, mu, c.data, c.noise_weights))
     if !iszero(c.gamma)
         if c.penalty === :hessian_frobenius
             _lean_launch!(_lean_hf_curv_kernel!, tmp, x, d, m, c.pairs,

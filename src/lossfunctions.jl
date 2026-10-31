@@ -1,5 +1,6 @@
 export Poisson, poisson_aux
 export Gauss, gauss_aux
+export WeightedGauss, weighted_gauss_aux
 export ScaledGauss, scaled_gauss_aux
 export Anscombe, anscombe_aux
 
@@ -79,6 +80,45 @@ function Gauss()
     return gauss_aux
 end
 
+
+
+
+
+"""
+    weighted_gauss_aux(μ, meas, ω, storage=similar(μ))
+
+Calculates the Gaussian loss `Σ ω (μ - meas)²` with a known, spatially varying
+noise variance, where `ω` are the nonnegative per-pixel weights (inverse noise
+variances, up to a common factor). `ω` is an array of the size of `meas`.
+"""
+function weighted_gauss_aux(μ, meas, ω, storage=similar(μ))
+    storage .= ω .* abs2.(μ .- meas)
+    return sum(storage)
+end
+
+function ChainRulesCore.rrule(::typeof(weighted_gauss_aux), μ, meas, ω, storage)
+    Y = weighted_gauss_aux(μ, meas, ω, storage)
+    function weighted_gauss_aux_pullback(xbar)
+        return NoTangent(), 2 .* xbar .* ω .* (μ .- meas), (ChainRulesCore.@not_implemented "Save computation"), (ChainRulesCore.@not_implemented "Save computation"), (ChainRulesCore.@not_implemented "Save computation")
+    end
+    return Y, weighted_gauss_aux_pullback
+end
+
+
+"""
+    WeightedGauss(ω)
+
+Returns a function to calculate the Gaussian loss with the per-pixel weights `ω`,
+i.e. the inverse noise variances (a variance map `v` gives `ω = 1 ./ v`).
+Check the help of `weighted_gauss_aux`.
+Note that `deconvolution` normalizes the data by its mean by default; only the
+shape of `ω` matters for the minimizer, but its overall scale sets the strength
+of a regularizer relative to the data term, so normalize `ω` to a mean of 1 to
+keep `λ` comparable to the unweighted [`Gauss`](@ref) loss.
+"""
+function WeightedGauss(ω)
+    return (μ, meas, storage=similar(μ)) -> weighted_gauss_aux(μ, meas, ω, storage)
+end
 
 
 

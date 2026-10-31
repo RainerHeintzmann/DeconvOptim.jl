@@ -31,8 +31,12 @@ gradient, search direction, `H(x d)`, `H(d²)`), plus a padded copy of the
 data when padding.
 
 # Keyword arguments
-- `loss=:poisson`: `:poisson`, `:anscombe` or `:gauss` (`Σ (μ - measured)²`,
-  the noise variance absorbed in `gamma`).
+- `loss=:poisson`: `:poisson`, `:anscombe` or `:gauss` (`Σ ω (μ - measured)²`,
+  the constant noise variance absorbed in `gamma`).
+- `noise_weights=nothing`: per-pixel weights `ω` (inverse variances) of the
+  `:gauss` loss, an array of the size of `measured`; `nothing` means `ω = 1`.
+  The line function stays a quartic, so MAPGR keeps its closed-form step.
+  See [`map_cj_lean`](@ref).
 - `penalty=:good`: `:good` (Good's roughness `-4 xᵀLx`) or
   `:hessian_frobenius`.
 - `anscombe_offset=3/8`: `β` of the `:anscombe` loss, in measured counts.
@@ -67,6 +71,7 @@ function map_cj_exact(measured::AbstractArray, psf::AbstractArray;
                       conv_dims=1:ndims(measured),
                       normalize_psf=true,
                       padding=0.0,
+                      noise_weights=nothing,
                       callback=nothing)
     iterations isa Integer && iterations >= 0 ||
         throw(ArgumentError("`iterations` must be a nonnegative integer"))
@@ -79,7 +84,7 @@ function map_cj_exact(measured::AbstractArray, psf::AbstractArray;
     c, x = _lean_setup(measured, psf; penalty, loss, anscombe_offset,
                        mapping=:square, mapping_scale=1.0, gamma, epsilon,
                        weights, background, initial, conv_dims, normalize_psf,
-                       padding)
+                       padding, noise_weights)
     T = eltype(x)
     mu = similar(x)
     gradient = similar(x)
@@ -219,18 +224,18 @@ function _pointwise_data_line(c, mu, m1, m2, alpha)
     return (v0, v1, v2)
 end
 
-# Coefficients (q0, ..., q4) of the Gaussian data term Σ (r0 + 2α m1 + α² m2)²
+# Coefficients (q0, ..., q4) of the Gaussian data term Σ ω (r0 + 2α m1 + α² m2)²
 # over the measured region, r0 = H x² + b - g, m1 = H(x d), m2 = H(d²).
 function _gauss_data_coefficients(c, mu, m1, m2)
     b = c.background
     in_data(g, v) = ifelse(g >= zero(g), v, zero(v))
-    s(f) = Float64(sum(_lazy(f, mu, m1, m2, c.data)))
-    srr = s((u, p, q, g) -> in_data(g, abs2(u + b - g)))
-    sr1 = s((u, p, q, g) -> in_data(g, (u + b - g) * p))
-    s11 = s((u, p, q, g) -> in_data(g, p * p))
-    sr2 = s((u, p, q, g) -> in_data(g, (u + b - g) * q))
-    s12 = s((u, p, q, g) -> in_data(g, p * q))
-    s22 = s((u, p, q, g) -> in_data(g, q * q))
+    s(f) = Float64(sum(_lazy(f, mu, m1, m2, c.data, c.noise_weights)))
+    srr = s((u, p, q, g, w) -> in_data(g, w * abs2(u + b - g)))
+    sr1 = s((u, p, q, g, w) -> in_data(g, w * (u + b - g) * p))
+    s11 = s((u, p, q, g, w) -> in_data(g, w * p * p))
+    sr2 = s((u, p, q, g, w) -> in_data(g, w * (u + b - g) * q))
+    s12 = s((u, p, q, g, w) -> in_data(g, w * p * q))
+    s22 = s((u, p, q, g, w) -> in_data(g, w * q * q))
     return (srr, 4 * sr1, 4 * s11 + 2 * sr2, 4 * s12, s22)
 end
 

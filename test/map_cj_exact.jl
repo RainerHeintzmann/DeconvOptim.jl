@@ -15,11 +15,11 @@ function _exact_test_problem(n=(16, 15); seed=1)
 end
 
 _exact_context(measured, psf; loss, penalty, gamma, epsilon=0.5, weights=nothing,
-               padding=0.0) =
+               padding=0.0, noise_weights=nothing) =
     DeconvOptim._lean_setup(measured, psf; penalty, loss, anscombe_offset=3 / 8,
         mapping=:square, mapping_scale=1.0, gamma, epsilon, weights,
         background=1.0, initial=nothing, conv_dims=1:2, normalize_psf=true,
-        padding)
+        padding, noise_weights)
 
 # the functional, computed directly from x
 function _exact_objective(c, x)
@@ -122,4 +122,74 @@ end
     @test_throws ArgumentError map_cj_exact(measured, psf; penalty=:tv)
     @test_throws ArgumentError map_cj_exact(measured, psf; loss=:laplace)
     @test_throws ArgumentError map_cj_exact(measured, psf; newton_iterations=0)
+end
+
+
+@testset "MAP-CJ exact: per-pixel noise weights (MAPGR / MAPGH)" begin
+    obj, psf, measured, rng = _exact_test_problem((18, 17); seed=5)
+    omega = 0.2 .+ 2 .* rand(rng, size(measured)...)
+    for penalty in (:good, :hessian_frobenius), padding in (0.0, 0.3)
+        c, x = _exact_context(measured, psf; loss=:gauss, penalty, gamma=0.4,
+                              weights=(1.0, 0.6), padding, noise_weights=omega)
+        x .= 1 .+ rand(rng, size(x)...)
+        d = 0.2 .* randn(rng, size(x)...)
+        mu, m1, m2, work = similar(x), similar(x), similar(x), similar(x)
+        DeconvOptim._lean_model!(c, mu, x)
+        m1 .= x .* d; c.conv!(m1, m1, false)
+        m2 .= d .* d; c.conv!(m2, m2, false)
+        q = DeconvOptim._gauss_data_coefficients(c, mu, m1, m2)
+        # the weighted data term along the line equals the objective without penalty
+        c0 = merge(c, (gamma=zero(c.gamma),))
+        for a in (0.0, 0.4)
+            @test DeconvOptim._quartic(q, a) ≈ _exact_objective(c0, x .+ a .* d) rtol=1e-9
+        end
+        # gradient and curvature match the directional derivatives of the objective
+        grad, gf = similar(x), similar(x)
+        DeconvOptim._lean_gradient!(c, grad, gf, x, mu)
+        h = 1e-5
+        phi(a) = _exact_objective(c, x .+ a .* d)
+        @test dot(grad, d) ≈ (phi(h) - phi(-h)) / (2h) rtol=1e-5
+        d2 = DeconvOptim._lean_curvature!(c, gf, x, d, mu)      # gf = g_f from the gradient
+        h2 = 1e-3
+        @test d2 ≈ (phi(h2) - 2phi(0.0) + phi(-h2)) / h2^2 rtol=1e-3
+    end
+
+    # a constant weight c is the same as the unweighted loss with gamma / c
+    for penalty in (:good, :hessian_frobenius)
+        a = map_cj_exact(measured, psf; loss=:gauss, penalty, gamma=0.05, epsilon=1.0,
+            background=1.0, iterations=40, saddle_escape=0, noise_weights=fill(4.0, size(measured)))
+        b = map_cj_exact(measured, psf; loss=:gauss, penalty, gamma=0.05 / 4, epsilon=1.0,
+            background=1.0, iterations=40, saddle_escape=0)
+        @test a ≈ b rtol=1e-4
+    end
+
+    # a pixel with weight 0 has no influence, whatever its value
+    w = ones(size(measured)); w[9, 9] = 0
+    spoiled = copy(measured); spoiled[9, 9] += 500
+    for f in (map_cj_exact, map_cj_lean)
+        r1 = f(measured, psf; loss=:gauss, gamma=0.05, background=1.0, iterations=30,
+               saddle_escape=0, initial=1.0, noise_weights=w)
+        r2 = f(spoiled, psf; loss=:gauss, gamma=0.05, background=1.0, iterations=30,
+               saddle_escape=0, initial=1.0, noise_weights=w)
+        @test r1 ≈ r2 rtol=1e-6
+        # ... while without the weight the outlier does matter
+        u2 = f(spoiled, psf; loss=:gauss, gamma=0.05, background=1.0, iterations=30,
+               saddle_escape=0, initial=1.0)
+        @test !isapprox(r1, u2; rtol=1e-3)
+    end
+
+    # weighted reconstruction decreases the weighted objective monotonically
+    c, _ = _exact_context(measured, psf; loss=:gauss, penalty=:hessian_frobenius,
+                          gamma=0.05, epsilon=1.0, noise_weights=omega)
+    values = Float64[]
+    rec = map_cj_exact(measured, psf; loss=:gauss, penalty=:hessian_frobenius, gamma=0.05,
+        epsilon=1.0, background=1.0, iterations=60, saddle_escape=0, noise_weights=omega,
+        callback=(it, o, m) -> (push!(values, _exact_objective(c, sqrt.(o))); false))
+    @test all(isfinite, rec) && all(diff(values) .<= 1e-9 .* abs.(values[1:end-1]))
+
+    # argument checks
+    @test_throws ArgumentError map_cj_exact(measured, psf; loss=:poisson, noise_weights=omega)
+    @test_throws ArgumentError map_cj_exact(measured, psf; loss=:gauss, noise_weights=omega[1:end-1, :])
+    @test_throws ArgumentError map_cj_exact(measured, psf; loss=:gauss, noise_weights=-omega)
+    @test_throws ArgumentError map_cj_lean(measured, psf; loss=:anscombe, noise_weights=omega)
 end
