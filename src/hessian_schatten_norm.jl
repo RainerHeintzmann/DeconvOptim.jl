@@ -339,7 +339,7 @@ function ChainRulesCore.rrule(f::HessianSchattenNorm, arr::AbstractArray)
     y = f(arr)
     function hs_pullback(Δ)
         gr = hs_gradient(arr, f.p, f.sum_dims, f.weights)
-        return ChainRulesCore.NoTangent(), Δ .* gr
+        return ChainRulesCore.NoTangent(), eltype(gr)(Δ) .* gr   # keep the array eltype (Float32)
     end
     return y, hs_pullback
 end
@@ -352,7 +352,7 @@ function ChainRulesCore.rrule(::typeof(HS_generic), arr::AbstractArray, p, sum_d
     y = HS_generic(arr, p, sum_dims, weights)
     function hsgen_pullback(Δ)
         gr = hs_gradient(arr, p, sum_dims, weights)
-        return ChainRulesCore.NoTangent(), Δ .* gr, ChainRulesCore.NoTangent(),
+        return ChainRulesCore.NoTangent(), eltype(gr)(Δ) .* gr, ChainRulesCore.NoTangent(),
                ChainRulesCore.NoTangent(), ChainRulesCore.NoTangent()
     end
     return y, hsgen_pullback

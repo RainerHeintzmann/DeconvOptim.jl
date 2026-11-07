@@ -51,6 +51,10 @@ by the data (Almeida & Figueiredo 2013).
    `0` always runs all iterations.
 - `newton_steps=6`: number of per-pixel Newton steps for the `Anscombe` prox.
 - `check_every=10`: residuals (and `ρ`) are evaluated every `check_every` iterations.
+- `progress_every=1`: `progress`/`debug_f` are called every `progress_every`
+   iterations (each report costs an extra forward model evaluation).
+- `callback=nothing`: `callback(iteration, x)` is called after every iteration with
+   the current (non-negative) iterate; returning `true` stops the solver.
 """
 Base.@kwdef struct ADMM
     ρ::Union{Nothing, Float64} = nothing
@@ -59,6 +63,8 @@ Base.@kwdef struct ADMM
     tol::Float64 = 0.0
     newton_steps::Int = 6
     check_every::Int = 10
+    progress_every::Int = 1
+    callback::Any = nothing
     ρ_balance::Float64 = 10.0
     ρ_factor::Float64 = 2.0
 end
@@ -91,28 +97,100 @@ Base.adjoint(s::Stencil) = Stencil([map(-, o) for o in s.offsets], s.coeffs)
 
 _unit(N, d, s) = ntuple(i -> i == d ? s : 0, N)
 
-# out .+= c .* x[i + o], periodic; device-generic (only broadcasts over views)
-function _shifted_add!(out, x, o, c)
-    parts = ntuple(ndims(x)) do d
-        n = size(x, d)
+# out[i] = f(out[i], xs[1][i + o], xs[2][i + o], …), periodic; the shift is split
+# into contiguous blocks, so only broadcasts over views are used (device-generic)
+function _shift_apply!(f, out, o, xs...)
+    parts = ntuple(ndims(out)) do d
+        n = size(out, d)
         s = mod(o[d], n)
         s == 0 ? ((1:n, 1:n),) : ((1:n-s, 1+s:n), (n-s+1:n, 1:s))
     end
     for p in Iterators.product(parts...)
         dst = view(out, map(first, p)...)
-        src = view(x, map(last, p)...)
-        dst .+= c .* src
+        _block_op!(f, dst, map(x -> view(x, map(last, p)...), xs)...)
     end
     return out
 end
 
+# CPU: columns along dimension 1 are contiguous; the shift along dimension 1
+# splits each column into two SIMD loops, the other dimensions wrap per column
+function _shift_apply!(f, out::Array{<:Any, N}, o, xs::Array...) where N
+    sz = size(out)
+    n1 = sz[1]
+    s1 = mod(o[1], n1)
+    cols = CartesianIndices(ntuple(d -> 1:sz[d+1], N - 1))
+    lcols = LinearIndices(cols)
+    ncol = length(cols)
+    body = (lo, hi) -> begin
+        for c in lo:hi
+            J = cols[c]
+            Js = CartesianIndex(ntuple(d -> mod1(J[d] + o[d+1], sz[d+1]), N - 1))
+            db = (c - 1) * n1
+            sb = (lcols[Js] - 1) * n1
+            @inbounds @simd for i in 1:n1-s1
+                out[db+i] = f(out[db+i], map(x -> x[sb+i+s1], xs)...)
+            end
+            @inbounds @simd for i in n1-s1+1:n1
+                out[db+i] = f(out[db+i], map(x -> x[sb+i+s1-n1], xs)...)
+            end
+        end
+    end
+    if Threads.nthreads() == 1 || length(out) < 1 << 15 || ncol < 2
+        body(1, ncol)
+    else
+        nt = min(Threads.nthreads(), ncol)
+        Threads.@threads :static for t in 1:nt
+            body(div((t - 1) * ncol, nt) + 1, div(t * ncol, nt))
+        end
+    end
+    return out
+end
+
+_block_op!(f, dst, srcs...) = (dst .= f.(dst, srcs...))
+_shifted_add!(out, x, o, c) = _shift_apply!((d, v) -> d + c * v, out, o, x)
+
 function apply!(out, s::Stencil, x)
     fill!(out, zero(eltype(out)))
+    return apply_add!(out, s, x)
+end
+
+# out .+= S x
+function apply_add!(out, s::Stencil, x)
     for (o, c) in zip(s.offsets, s.coeffs)
         _shifted_add!(out, x, o, c)
     end
     return out
 end
+
+# out .+= S (a - b)   (fused, no temporary)
+function apply_add_diff!(out, s::Stencil, a, b)
+    for (o, c) in zip(s.offsets, s.coeffs)
+        _shift_apply!((d, u, v) -> d + c * (u - v), out, o, a, b)
+    end
+    return out
+end
+
+# elementwise dst[i] = f(srcs[1][i], …): multithreaded on CPU arrays (Julia
+# broadcasts are single-threaded, ADMM is memory-bound), plain broadcast otherwise
+function _tb!(f, dst::Array, srcs::Array...)
+    L = length(dst)
+    nt = Threads.nthreads()
+    if nt == 1 || L < 1 << 15
+        @inbounds @simd for i in eachindex(dst)
+            dst[i] = f(map(a -> a[i], srcs)...)
+        end
+        return dst
+    end
+    Threads.@threads :static for c in 1:nt
+        lo = div((c - 1) * L, nt) + 1
+        hi = div(c * L, nt)
+        @inbounds @simd for i in lo:hi
+            dst[i] = f(map(a -> a[i], srcs)...)
+        end
+    end
+    return dst
+end
+_tb!(f, dst, srcs...) = (dst .= f.(srcs...); dst)
 
 # |FFT symbol|² of a stencil on the rfft grid, computed on the CPU
 function _abs2_symbol(s::Stencil, sz, ::Type{T}) where T
@@ -246,25 +324,16 @@ end
 
 function prox_data!(z, l::ADMMLoss, v, y, ρ, bg, mask, nsteps)
     ρT = eltype(z)(ρ)
-    pr = l isa AnscombeProx ? (vv, yy) -> prox(l, vv, yy, ρT, bg, nsteps) :
-                              (vv, yy) -> prox(l, vv, yy, ρT, bg)
-    if isnothing(mask)
-        _map!(pr, z, v, y)
+    if l isa AnscombeProx
+        _prox_apply!((vv, yy) -> prox(l, vv, yy, ρT, bg, nsteps), z, v, y, mask)
     else
-        _map!((vv, yy, mm) -> mm > 0 ? pr(vv, yy) : vv, z, v, y, mask)
+        _prox_apply!((vv, yy) -> prox(l, vv, yy, ρT, bg), z, v, y, mask)
     end
     return z
 end
 
-# elementwise map; multithreaded on the CPU (the Anscombe Newton loop does not
-# SIMD-vectorize), a plain broadcast for other (e.g. GPU) arrays
-function _map!(f, z::Array, args::Array...)
-    Threads.@threads for i in eachindex(z, args...)
-        @inbounds z[i] = f(map(a -> a[i], args)...)
-    end
-    return z
-end
-_map!(f, z, args...) = (z .= f.(args...))
+_prox_apply!(pr, z, v, y, ::Nothing) = _tb!(pr, z, v, y)
+_prox_apply!(pr, z, v, y, mask) = _tb!((vv, yy, mm) -> mm > 0 ? pr(vv, yy) : vv, z, v, y, mask)
 
 # ---------------------------------------------------------------------------
 # proximal operators of the split regularizer blocks (in place, v → z)
@@ -272,23 +341,21 @@ _map!(f, z, args...) = (z .= f.(args...))
 function prox_block!(zs, kind, vs, κ, s1, s2)
     T = eltype(s1)
     if kind == :group
-        s1 .= abs2.(vs[1])
-        for k in 2:length(vs)
-            s1 .+= abs2.(vs[k])
-        end
-        s1 .= max.(one(T) .- κ ./ sqrt.(s1 .+ floatmin(T)), zero(T))
+        # shrinkage factor max(1 - κ/‖v‖, 0) in one pass over all components
+        o, z0, tiny = one(T), zero(T), floatmin(T)   # values, not the type T (GPU kernels need isbits closures)
+        _tb!((v...) -> max(o - κ / sqrt(sum(abs2, v) + tiny), z0), s1, vs...)
         for k in eachindex(vs)
-            zs[k] .= s1 .* vs[k]
+            _tb!(*, zs[k], s1, vs[k])
         end
     else # :schatten, components (a, d, c) with c = √2·b, eigenvalue soft-thresholding
         a, d, c = vs
-        # s1: half difference of the eigenvalues r, s2: new mean m'
-        s1 .= sqrt.(abs2.((a .- d) ./ 2) .+ abs2.(c) ./ 2)
-        s2 .= _hs_newmean.((a .+ d) ./ 2, s1, κ)
-        s1 .= _hs_newratio.((a .+ d) ./ 2, s1, κ)
-        zs[1] .= s2 .+ s1 .* (a .- (a .+ d) ./ 2)
-        zs[2] .= s2 .+ s1 .* (d .- (a .+ d) ./ 2)
-        zs[3] .= s1 .* c
+        # s1: half difference of the eigenvalues r → ratio r'/r,  s2: new mean m'
+        _tb!((a, d, c) -> sqrt(abs2((a - d) / 2) + abs2(c) / 2), s1, a, d, c)
+        _tb!((a, d, r) -> _hs_newmean((a + d) / 2, r, κ), s2, a, d, s1)
+        _tb!((a, d, r) -> _hs_newratio((a + d) / 2, r, κ), s1, a, d, s1)
+        _tb!((m, f, a, d) -> m + f * (a - d) / 2, zs[1], s2, s1, a, d)
+        _tb!((m, f, a, d) -> m - f * (a - d) / 2, zs[2], s2, s1, a, d)
+        _tb!(*, zs[3], s1, c)
     end
     return zs
 end
@@ -300,6 +367,50 @@ end
 @inline function _hs_newratio(m, r, κ)
     rn = (_soft(m + r, κ) - _soft(m - r, κ)) / 2
     return r > floatmin(r) ? rn / r : zero(r)
+end
+
+# ---------------------------------------------------------------------------
+# fused elementwise prox update (CPU): one pass reads v (held in w), writes
+# z = prox(v) and w = v - z for all components of a block
+# ---------------------------------------------------------------------------
+@inline function _pix_prox(::Val{:group}, v::NTuple{K, T}, κ) where {K, T}
+    f = max(one(T) - κ / sqrt(sum(abs2, v) + floatmin(T)), zero(T))
+    return map(vi -> f * vi, v)
+end
+@inline function _pix_prox(::Val{:schatten}, v::NTuple{3, T}, κ) where T
+    a, d, c = v
+    r = sqrt(abs2((a - d) / 2) + abs2(c) / 2)
+    m = (a + d) / 2
+    mn = _hs_newmean(m, r, κ)
+    f = _hs_newratio(m, r, κ)
+    return (mn + f * (a - d) / 2, mn - f * (a - d) / 2, f * c)
+end
+
+# threaded loop over static chunks of 1:L, f(lo, hi)
+function _tchunks(f, L)
+    nt = Threads.nthreads()
+    if nt == 1 || L < 1 << 15
+        f(1, L)
+    else
+        Threads.@threads :static for c in 1:nt
+            f(div((c - 1) * L, nt) + 1, div(c * L, nt))
+        end
+    end
+    return nothing
+end
+
+function _prox_update!(::Val{K}, kind::Val, zs, ws, κ) where K
+    zt = ntuple(k -> zs[k], Val(K))
+    wt = ntuple(k -> ws[k], Val(K))
+    _tchunks(length(wt[1])) do lo, hi
+        @inbounds @simd for i in lo:hi
+            v = map(w -> w[i], wt)
+            z = _pix_prox(kind, v, κ)
+            map((za, zi) -> (za[i] = zi), zt, z)
+            map((wa, vi, zi) -> (wa[i] = vi - zi), wt, v, z)
+        end
+    end
+    return nothing
 end
 
 # ---------------------------------------------------------------------------
@@ -383,6 +494,8 @@ function admm_deconvolution(measured::AbstractArray{T}, psf, x0;
     adj = [[s' for s in b.stencils] for b in blocks]
     z3 = nonneg ? max.(x, zero(T)) : copy(x); w3 = zero(x0)
     r = similar(x0); t = similar(x0); s1 = similar(x0); s2 = similar(x0)
+    # fused elementwise prox update on the CPU (GPU arrays: generic broadcasts)
+    fused = x0 isa Array
 
     history = NamedTuple{(:iteration, :r_rel, :s_rel, :ρ), Tuple{Int, Float64, Float64, Float64}}[]
     converged = false
@@ -390,9 +503,14 @@ function admm_deconvolution(measured::AbstractArray{T}, psf, x0;
     report(it, ρ) = begin
         isnothing(debug_f) || debug_f(z3)
         if !isnothing(progress)
-            Base.invokelatest(record_progress!, progress, z3, it,
-                              admm_objective(z3, P, Pi, Hhat, y, measured, mask, loss, regularizer, λT, bg),
-                              time() - t0, ρ)
+            # errors of the progress recorder do not abort the solver (as in `invert`);
+            # use `opt.callback` to stop
+            try
+                Base.invokelatest(record_progress!, progress, z3, it,
+                                  admm_objective(z3, P, Pi, Hhat, y, measured, mask, loss, regularizer, λT, bg),
+                                  time() - t0, ρ)
+            catch
+            end
         end
     end
     report(0, ρ)
@@ -401,26 +519,24 @@ function admm_deconvolution(measured::AbstractArray{T}, psf, x0;
     for outer it in 1:niter
         check = it % opt.check_every == 0 || it == niter
         # ---- x-update:  x = (HᵀH + ΣKᵀK + I + 2λ/ρ QᵀQ)⁻¹ [Hᵀ(z₁-w₁) + ΣKᵀ(z₂-w₂) + (z₃-w₃)]
-        r .= z1 .- w1
+        _tb!(-, r, z1, w1)
         mul!(R1, P, r)
-        r .= z3 .- w3
+        _tb!(-, r, z3, w3)
         for (bi, b) in enumerate(blocks), k in eachindex(b.stencils)
-            s1 .= zs[bi][k] .- ws[bi][k]
-            apply!(t, adj[bi][k], s1)
-            r .+= t
+            apply_add_diff!(r, adj[bi][k], zs[bi][k], ws[bi][k])
         end
         mul!(R2, P, r)
-        X .= (Hc .* R1 .+ R2) ./ denom
-        Xt .= Hhat .* X; mul!(Hx, Pi, Xt)
-        Xt .= X;         mul!(x, Pi, Xt)
+        _tb!((hc, r1, r2, dn) -> (hc * r1 + r2) / dn, X, Hc, R1, R2, denom)
+        _tb!(*, Xt, Hhat, X); mul!(Hx, Pi, Xt)
+        copyto!(Xt, X);       mul!(x, Pi, Xt)
 
         # ---- z/w-updates, residuals ‖Kx - z‖ (primal) and ‖z - z_old‖ (dual, scaled)
         rp2 = 0.0; rd2 = 0.0; nKx2 = 0.0; nz2 = 0.0; nw2 = 0.0
         # data block
         check && copyto!(s2, z1)
-        t .= Hx .+ w1
+        _tb!(+, t, Hx, w1)
         prox_data!(z1, lossp, t, y, ρ, bg, mask, opt.newton_steps)
-        w1 .= t .- z1
+        _tb!(-, w1, t, z1)
         if check
             rp2 += sum(abs2, Hx .- z1)
             rd2 += sum(abs2, z1 .- s2); nKx2 += sum(abs2, Hx); nz2 += sum(abs2, z1); nw2 += sum(abs2, w1)
@@ -430,15 +546,21 @@ function admm_deconvolution(measured::AbstractArray{T}, psf, x0;
             vs = ws[bi]          # w holds v = Kx + w during the prox
             olds = check ? [copy(z) for z in zs[bi]] : nothing
             for k in eachindex(b.stencils)
-                apply!(t, b.stencils[k], x)
-                vs[k] .+= t
                 if check
+                    apply!(t, b.stencils[k], x)
                     nKx2 += sum(abs2, t)
+                    _tb!(+, vs[k], vs[k], t)
+                else
+                    apply_add!(vs[k], b.stencils[k], x)
                 end
             end
-            prox_block!(zs[bi], b.kind, vs, T(λT / ρ), s1, s2)
+            if fused
+                _prox_update!(Val(length(b.stencils)), Val(b.kind), zs[bi], vs, T(λT / ρ))
+            else
+                prox_block!(zs[bi], b.kind, vs, T(λT / ρ), s1, s2)
+                foreach(k -> _tb!(-, vs[k], vs[k], zs[bi][k]), eachindex(b.stencils))
+            end
             for k in eachindex(b.stencils)
-                vs[k] .-= zs[bi][k]
                 if check
                     apply!(t, b.stencils[k], x)
                     rp2 += sum(abs2, t .- zs[bi][k]); rd2 += sum(abs2, zs[bi][k] .- olds[k])
@@ -448,19 +570,22 @@ function admm_deconvolution(measured::AbstractArray{T}, psf, x0;
         end
         # positivity block
         check && copyto!(s2, z3)
-        t .= x .+ w3
         if nonneg
-            z3 .= max.(t, zero(T))
+            z0 = zero(T)
+            _tb!((a, b) -> max(a + b, z0), z3, x, w3)
         else
-            z3 .= t
+            _tb!(+, z3, x, w3)
         end
-        w3 .= t .- z3
+        _tb!((a, b, z) -> a + b - z, w3, x, w3, z3)
         if check
             rp2 += sum(abs2, x .- z3); rd2 += sum(abs2, z3 .- s2)
             nKx2 += sum(abs2, x); nz2 += sum(abs2, z3); nw2 += sum(abs2, w3)
         end
 
-        report(it, ρ)
+        (it % opt.progress_every == 0 || it == niter) && report(it, ρ)
+        if !isnothing(opt.callback) && opt.callback(it, z3) === true
+            break       # stop requested: return the current (feasible) iterate
+        end
 
         if check
             r_rel = sqrt(rp2) / max(sqrt(nKx2), sqrt(nz2), eps())

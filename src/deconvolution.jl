@@ -40,6 +40,10 @@ regularizers and mappings.
 - `initial=mean(measured)`: defines a value (or array) with the initial guess. This will be pulled through the inverse mapping function
                      and extended with a mean value (if border regions are used).
 - `debug_f=nothing`: A debug function which must take a single argument, the current reconstruction.
+- `positivity=nothing`: optional smooth positivity penalty ([`Positivity`](@ref)) acting as a second
+    regularizer next to `regularizer` (e.g. `regularizer=TH(), positivity=Positivity(), mapping=nothing`).
+    Its weight is ramped up over continuation stages, so positivity is enforced strongly only towards the
+    end. With `opt=ADMM()` positivity is always exact (projection) and this only implies `x ≥ 0`.
 - `normalize_data` : If true, the data is normalized (mean is one) prior to deconvolution, default: true, 
                     for a psf which can be positive and negative, you may want to set this to `false`
   `normalize_psf` : If true, the psf is normalized (sum is one) prior to deconvolution, default: true, 
@@ -81,6 +85,7 @@ function deconvolution(measured::AbstractArray{T, N}, psf;
         normalize_psf = true,
         debug_f=nothing,
         progress=nothing,
+        positivity=nothing,
         opt_package=Opt_Optim) where {T, N}
 
 
@@ -160,7 +165,8 @@ function deconvolution(measured::AbstractArray{T, N}, psf;
         res_out, res = admm_deconvolution(measured, psf, mf(rec0);
                                           loss=loss, regularizer=regularizer, λ=λ,
                                           background=background, opt=opt, iterations=iterations,
-                                          nonneg=!isnothing(mapping), debug_f=debug_f, progress=progress)
+                                          nonneg=!isnothing(mapping) || !isnothing(positivity),
+                                          debug_f=debug_f, progress=progress)
         res_out = copy(res_out)
         if (normalize_data)
             res_out .*= rescaling
@@ -194,7 +200,8 @@ function deconvolution(measured::AbstractArray{T, N}, psf;
                           opt_options=opt_options,
                           mapping=mapping,
                           loss=loss,
-                          debug_f=debug_f, progress=progress, opt_package=opt_package)
+                          debug_f=debug_f, progress=progress, positivity=positivity,
+                          opt_package=opt_package)
 
     if (normalize_data)
         res_out .*= rescaling

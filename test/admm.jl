@@ -1,5 +1,9 @@
 using DeconvOptim: prox, PoissonProx, GaussProx, AnscombeProx, apply!, admm_reg
 
+# a progress recorder that always fails (ADMM must keep running)
+struct _Thrower end
+DeconvOptim.record_progress!(::_Thrower, args...) = error("progress failed")
+
 @testset "ADMM" begin
     @testset "proximal operators are minimizers" begin
         rng = MersenneTwister(1)
@@ -67,6 +71,11 @@ using DeconvOptim: prox, PoissonProx, GaussProx, AnscombeProx, apply!, admm_reg
         r, o = deconvolution(img, psf; regularizer=TV(), opt=ADMM(), padding=0.1)
         @test size(r) == size(img)
         @test size(o.minimizer, 1) > size(img, 1)
+        # callback stop; an erroring progress recorder does not abort the solver
+        r, o = deconvolution(img, psf; regularizer=TV(), progress=_Thrower(),
+                             opt=ADMM(iterations=50, callback=(it, x) -> it >= 7))
+        @test o.iterations == 7
+        @test all(>=(0), r)
         r, o = deconvolution(img, psf; regularizer=TV(), opt=ADMM(tol=1e-3, iterations=2000))
         @test o.converged
         @test o.iterations < 2000

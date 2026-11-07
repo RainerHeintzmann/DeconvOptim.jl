@@ -9,6 +9,11 @@ TH
 HS
 ```
 
+## Positivity penalty
+```@docs
+Positivity
+```
+
 All regularizers are constructed via keyword arguments and return a function which takes the array to be regularized
 and returns a scalar. They support:
 - `sum_dims`: the array dimensions over which the regularizer is computed; the remaining dimensions only take part in the summation.

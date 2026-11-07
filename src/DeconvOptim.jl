@@ -15,7 +15,9 @@ using Optim
 using Statistics
 using StatsBase
 using FFTW
-FFTW.set_num_threads(12)
+# Note: a top-level FFTW.set_num_threads(...) here would only run during precompilation.
+# Multithreaded FFTW is deliberately not enabled at load time: it crashed
+# (EXCEPTION_ACCESS_VIOLATION in FFTW's spawn_apply) in the test suite on Windows.
 using LineSearches
 
 # possible up_sampling 
@@ -36,6 +38,7 @@ include("mappings.jl")
 # special CUDA regularizers
 include("regularizer_cuda.jl")
 include("regularizer.jl")
+include("positivity.jl")
 # include("regularizer_ka.jl")  # is fully functional but not faster and therefor currently not included
 include("utils.jl")
 include("conv.jl")

@@ -69,15 +69,16 @@ end
     hsp2 = HS(sum_dims=(1, 2), p=2)
     @test hsp2(x3) ≈ sum(k -> DeconvOptim.HSp(view(x3, :, :, k), p=2), axes(x3, 3))
 
-    # weights positional (centered stencils): H11' = w1^2*H11, H22' = w2^2*H22,
-    # H12' = w1*w2*H12, p=1 nuclear norm is |λ1|+|λ2|
+    # weights positional (centered stencils), same convention as TH/GR/TV
+    # (`HS weight unification`): H11' = w1*H11, H22' = w2*H22,
+    # H12' = sqrt(w1*w2)*H12, p=1 nuclear norm is |λ1|+|λ2|
     hsw = HS(sum_dims=(1, 2), weights=[2.0, 3.0])
     rw = 0.0
     for k in axes(x3, 3), j in 2:5, i in 2:5
         h11 = x3[i+1, j, k] - 2*x3[i, j, k] + x3[i-1, j, k]
         h22 = x3[i, j+1, k] - 2*x3[i, j, k] + x3[i, j-1, k]
         h12 = 0.25*(x3[i+1, j+1, k] - x3[i-1, j+1, k] - x3[i+1, j-1, k] + x3[i-1, j-1, k])
-        a = 4*h11; d = 9*h22; b = 6*h12
+        a = 2*h11; d = 3*h22; b = sqrt(6)*h12
         r = sqrt(1f-8 + (a-d)^2 + 4*b^2)
         lam1 = 0.5*(a+d+r); lam2 = 0.5*(a+d-r)
         rw += abs(1f-8 + lam1) + abs(1f-8 + lam2)
@@ -91,7 +92,7 @@ end
         h11 = x3[i+1, j, k] - 2*x3[i, j, k] + x3[i-1, j, k]
         h22 = x3[i, j+1, k] - 2*x3[i, j, k] + x3[i, j-1, k]
         h12 = 0.25*(x3[i+1, j+1, k] - x3[i-1, j+1, k] - x3[i+1, j-1, k] + x3[i-1, j-1, k])
-        a = 4*h11; d = 9*h22; b = 6*h12
+        a = 2*h11; d = 3*h22; b = sqrt(6)*h12
         r = sqrt(1f-8 + (a-d)^2 + 4*b^2)
         lam1 = 0.5*(a+d+r); lam2 = 0.5*(a+d-r)
         rp2w += (abs(1f-8 + lam1)^2 + abs(1f-8 + lam2)^2)^0.5

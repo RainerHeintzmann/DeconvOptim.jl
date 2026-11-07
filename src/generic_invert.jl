@@ -26,7 +26,10 @@ regularizers and mappings.
 - `opt_package=Opt_Optim`: decides which backend for the optimizer is used.
 - `opt=LBFGS()`: The chosen optimizer which must fit to `opt_package`. 
 - `opt_options=nothing`: Can be a options file required by Optim.jl. Will overwrite iterations.
-- `debug_f=nothing`: A debug function which must take a single argument, the current reconstruction. 
+- `debug_f=nothing`: A debug function which must take a single argument, the current reconstruction.
+- `positivity=nothing`: an optional smooth positivity penalty ([`Positivity`](@ref)),
+    added as a second regularizer next to `regularizer`, with a weight ramped up over
+    continuation stages. Use it with `mapping=nothing` instead of the `Non_negative()` mapping.
 """
 function invert(measured, rec0, forward;
     iterations=nothing, λ=eltype(rec0)(0.05),
@@ -37,6 +40,7 @@ function invert(measured, rec0, forward;
     loss=Poisson(),
     debug_f=nothing,
     progress=nothing,
+    positivity=nothing,
     opt_package=Opt_Optim)
 
     # if not special options are given, just restrict iterations
@@ -44,6 +48,10 @@ function invert(measured, rec0, forward;
         error("If `opt_options` are provided you need to include the iterations as part of these instead of providing the `iterations` argument.")
     end
     iterations = (iterations === nothing) ? 20 : iterations
+    # λ in the element type of the reconstruction: a Float64 λ (e.g. from a GUI)
+    # would turn the cotangents of the regularizer rrules, and with them gradient
+    # arrays, into Float64
+    λ = real(eltype(rec0))(λ)
 
     if opt_package <: Opt_Optim
         if opt_options === nothing
@@ -95,12 +103,22 @@ function invert(measured, rec0, forward;
         end
 
     storage_μ = deepcopy(measured)
+    # with a positivity penalty the forward model may become negative:
+    # continue Poisson/Anscombe smoothly below 1% of the mean data value
+    if !isnothing(positivity)
+        loss = continued_loss(loss, 0.01 * abs(mean(measured)))
+    end
+    # weight of the positivity penalty of the current continuation stage
+    pos_w = Ref(isnothing(positivity) ? 0.0 : last(stage_weights(positivity)))
     function total_loss(rec)
         # handle if there is a provided mapping function
         mf_rec = mf(rec)
         forward_v = forward(mf_rec)
         loss_v = sum(loss(forward_v, measured, storage_μ))
         loss_v += λ .* regularizer(mf_rec)
+        if !isnothing(positivity)
+            loss_v += eltype(rec)(pos_w[]) * positivity(mf_rec)
+        end
         return loss_v
     end
     # nice precompilation before calling Zygote etc.
@@ -141,7 +159,30 @@ function invert(measured, rec0, forward;
         # do the optimization with LBGFS using modern Optim API (f, g!)
         f(x) = fg!(true, nothing, x)
         g!(G, x) = fg!(nothing, G, x)
-        res = Optim.optimize(f, g!, rec0, opt, opt_options)
+        if isnothing(positivity)
+            res = Optim.optimize(f, g!, rec0, opt, opt_options)
+        else
+            # continuation: ramp the positivity weight over stages, each a fresh
+            # optimizer run started from the previous result. A callback that
+            # requests a stop (returns true) ends the whole ramp.
+            stopped = Ref(false)
+            cb0 = opt_options.callback
+            stop_cb = os -> begin
+                r = isnothing(cb0) ? false : cb0(os)
+                r === true && (stopped[] = true)
+                return r
+            end
+            ws = stage_weights(positivity)
+            its = stage_iterations(opt_options.iterations, length(ws))
+            ws = ws[end-length(its)+1:end]
+            x = rec0
+            for (w, n) in zip(ws, its)
+                pos_w[] = w
+                res = Optim.optimize(f, g!, x, opt, Optim.Options(opt_options; iterations=n, callback=stop_cb))
+                x = Optim.minimizer(res)
+                stopped[] && break
+            end
+        end
         res_out = mf(Optim.minimizer(res))
         # supports a different interface as for example used in OptimPackNextGen for the function 'vmlmb!'
     elseif isa(opt_package, Type{Opt_OptimPackNextGen})
@@ -157,6 +198,9 @@ function invert(measured, rec0, forward;
         error("Unknown optimizer interface $(typeof(opt_package))")
     end
 
+    if !isnothing(positivity) && positivity.clip
+        res_out = max.(res_out, zero(eltype(res_out)))
+    end
 
     return res_out, res
 end
