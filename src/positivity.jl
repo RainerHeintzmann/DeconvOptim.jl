@@ -109,7 +109,7 @@ function ChainRulesCore.rrule(::typeof(positivity_penalty), x, σ, mode::Symbol)
     y = positivity_penalty(x, σ, mode)
     function positivity_pullback(Δ)
         v = Val(mode)
-        return NoTangent(), eltype(x)(Δ) .* (xi -> _pos_grad(v, xi, σ)).(x), NoTangent(), NoTangent()
+        return NoTangent(), eltype(x)(unthunk(Δ)) .* (xi -> _pos_grad(v, xi, σ)).(x), NoTangent(), NoTangent()
     end
     return y, positivity_pullback
 end
@@ -157,7 +157,7 @@ end
 function ChainRulesCore.rrule(l::PoissonContinued, μ, meas, storage)
     y = l(μ, meas, storage)
     ε = eltype(μ)(l.ε)
-    pb(Δ) = (NoTangent(), eltype(μ)(Δ) .* _pc_grad.(μ, meas, ε), NoTangent(), NoTangent())
+    pb(Δ) = (NoTangent(), eltype(μ)(unthunk(Δ)) .* _pc_grad.(μ, meas, ε), NoTangent(), NoTangent())
     return y, pb
 end
 
@@ -169,7 +169,7 @@ end
 function ChainRulesCore.rrule(l::AnscombeContinued, μ, meas, storage)
     y = l(μ, meas, storage)
     T = eltype(μ)
-    pb(Δ) = (NoTangent(), T(Δ) .* _ac_grad.(μ, meas, T(l.b), T(l.ε)), NoTangent(), NoTangent())
+    pb(Δ) = (NoTangent(), T(unthunk(Δ)) .* _ac_grad.(μ, meas, T(l.b), T(l.ε)), NoTangent(), NoTangent())
     return y, pb
 end
 

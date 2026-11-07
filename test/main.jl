@@ -65,7 +65,17 @@ end
 
 @testset "Compare optimization with iterative lucy richardson scheme" begin
 
-    img = Float32.(testimage("resolution_test_512"));
+    # old TestImages versions (< 1.7) do not know this image: skip instead of
+    # aborting the whole test run (the later test files would not run at all)
+    img = try
+        Float32.(testimage("resolution_test_512"))
+    catch e
+        @warn "testimage(\"resolution_test_512\") is not available (TestImages ≥ 1.7 needed); skipping this testset" exception=e
+        nothing
+    end
+    if img === nothing
+        @test_skip false
+    else
     psf = Float32.(generate_psf(size(img), 30));
     img_b = conv(img, psf);
     img_n = poisson(img_b, 300);
@@ -85,6 +95,6 @@ end
     res = richardson_lucy_iterative(img_n, psf, regularizer=reg, iterations=400);
     res2, o = deconvolution(img_n, psf, regularizer=reg, iterations=40);
     @test ≈(res2 .+1, res .+ 1, rtol=0.02)
-
+    end
 
 end
