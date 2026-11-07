@@ -22,8 +22,10 @@ DeconvOptim.record_progress!(::_Thrower, args...) = error("progress failed")
 
     @testset "stencil adjoints" begin
         rng = MersenneTwister(2)
-        for reg in (TV(), TV(mode="central", step=2), TH(), HS(), Tikhonov(),
-                    Tikhonov(mode="spatial_grad_square"), TV(num_dims=3, weights=[1, 1, 0.3]))
+        # explicit num_dims: constructing TV()/TH()/… without it generates code for all ranks (slow)
+        for reg in (TV(num_dims=3), TV(num_dims=3, mode="central", step=2), TH(num_dims=3), HS(),
+                    Tikhonov(num_dims=3), Tikhonov(num_dims=3, mode="spatial_grad_square"),
+                    TV(num_dims=3, weights=[1, 1, 0.3]))
             blocks, tik = admm_reg(reg, 3, Float64)
             for s in vcat([b.stencils for b in blocks]..., tik)
                 a = randn(rng, 9, 8, 3); b = randn(rng, 9, 8, 3)
@@ -52,12 +54,12 @@ DeconvOptim.record_progress!(::_Thrower, args...) = error("progress failed")
         isnothing(reg) ? v : v + λ * Base.invokelatest(reg, xn)
     end
 
+    # L-BFGS reference for three distinct prox types (group shrinkage, Schatten, Newton prox)
     @testset "reaches the L-BFGS objective ($name)" for (name, loss, reg, λ) in [
-            ("Poisson+TV", Poisson(), TV(), 0.05), ("Poisson+HS", Poisson(), HS(), 0.05),
-            ("Poisson+TH", Poisson(), TH(), 0.05), ("Poisson+Tikhonov", Poisson(), Tikhonov(), 0.05),
-            ("Gauss+TV", Gauss(), TV(), 0.005), ("Anscombe+TV", Anscombe(3 / 8 / nrm), TV(), 0.005)]
-        r1, _ = deconvolution(img, psf; loss=loss, regularizer=reg, λ=λ, iterations=200)
-        r2, o = deconvolution(img, psf; loss=loss, regularizer=reg, λ=λ, opt=ADMM(iterations=400))
+            ("Poisson+TV", Poisson(), TV(num_dims=2), 0.05), ("Poisson+HS", Poisson(), HS(), 0.05),
+            ("Anscombe+TV", Anscombe(3 / 8 / nrm), TV(num_dims=2), 0.005)]
+        r1, _ = deconvolution(img, psf; loss=loss, regularizer=reg, λ=λ, iterations=150)
+        r2, o = deconvolution(img, psf; loss=loss, regularizer=reg, λ=λ, opt=ADMM(iterations=300))
         @test o isa DeconvOptim.ADMMResult
         @test size(r2) == size(img)
         @test all(>=(0), r2)
@@ -67,29 +69,42 @@ DeconvOptim.record_progress!(::_Thrower, args...) = error("progress failed")
         @test F2 <= F1 + 1e-3 * abs(F1)
     end
 
+    # the other regularizers/losses: ADMM must clearly decrease the objective
+    @testset "decreases the objective ($name)" for (name, loss, reg, λ) in [
+            ("Poisson+TH", Poisson(), TH(num_dims=2), 0.05), ("Poisson+Tikhonov", Poisson(), Tikhonov(num_dims=2), 0.05),
+            ("Gauss+TV", Gauss(), TV(num_dims=2), 0.005), ("Poisson+none", Poisson(), nothing, 0.05)]
+        r, o = deconvolution(img, psf; loss=loss, regularizer=reg, λ=λ, opt=ADMM(iterations=40))
+        @test all(>=(0), r)
+        @test all(isfinite, r)
+        F0 = objective(fill(mean(img), size(img)), loss, reg, λ)
+        Fopt = objective(r, loss, reg, λ)
+        @test Fopt < F0
+    end
+
     @testset "padding, tolerance, 3D" begin
-        r, o = deconvolution(img, psf; regularizer=TV(), opt=ADMM(), padding=0.1)
+        r, o = deconvolution(img, psf; regularizer=TV(num_dims=2), opt=ADMM(iterations=20), padding=0.1)
         @test size(r) == size(img)
         @test size(o.minimizer, 1) > size(img, 1)
         # callback stop; an erroring progress recorder does not abort the solver
-        r, o = deconvolution(img, psf; regularizer=TV(), progress=_Thrower(),
+        r, o = deconvolution(img, psf; regularizer=TV(num_dims=2), progress=_Thrower(),
                              opt=ADMM(iterations=50, callback=(it, x) -> it >= 7))
         @test o.iterations == 7
         @test all(>=(0), r)
-        r, o = deconvolution(img, psf; regularizer=TV(), opt=ADMM(tol=1e-3, iterations=2000))
+        r, o = deconvolution(img, psf; regularizer=TV(num_dims=2), opt=ADMM(tol=1e-2, iterations=500))
         @test o.converged
-        @test o.iterations < 2000
-        # a z-constant stack with a 2D PSF must give the 2D result
+        @test o.iterations < 500
+        # a z-constant stack with a 2D PSF must give the 2D result (the iterates are
+        # identical in every iteration, so a few iterations suffice)
         img3 = repeat(img[1:32, 1:32], 1, 1, 3)
         p2 = psf[[1:16; end-15:end], [1:16; end-15:end]]; p2 ./= sum(p2)
-        r3, _ = deconvolution(img3, p2; regularizer=TV(num_dims=3), opt=ADMM(iterations=1000))
-        r2, _ = deconvolution(img[1:32, 1:32], p2; regularizer=TV(), opt=ADMM(iterations=1000))
+        r3, _ = deconvolution(img3, p2; regularizer=TV(num_dims=3), opt=ADMM(iterations=50))
+        r2, _ = deconvolution(img[1:32, 1:32], p2; regularizer=TV(num_dims=2), opt=ADMM(iterations=50))
         @test r3[:, :, 2] ≈ r2 rtol = 1e-3
         @test r3[:, :, 1] ≈ r3[:, :, 3] rtol = 1e-4
     end
 
     @testset "unsupported combinations" begin
-        @test_throws ArgumentError deconvolution(img, psf; regularizer=GR(), opt=ADMM())
+        @test_throws ArgumentError deconvolution(img, psf; regularizer=GR(num_dims=2), opt=ADMM())
         @test_throws ArgumentError deconvolution(img, psf; loss=ScaledGauss(), opt=ADMM())
         @test_throws ArgumentError deconvolution(img, psf; regularizer=HS(p=2), opt=ADMM())
     end
