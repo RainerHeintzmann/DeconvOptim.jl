@@ -10,6 +10,21 @@ export generate_spatial_grad_square, generate_GR, generate_TV
 # kernels in `regularizer_cuda.jl`.
 const NMAX = 10
 
+"""
+    TaggedRegularizer(kind, f, params)
+
+Callable wrapper returned by `TV`, `TH` and `Tikhonov`. Calling it evaluates the
+regularizer `f(arr)` exactly as before; `kind` and `params` (the constructor
+arguments) allow solvers without automatic differentiation (see [`ADMM`](@ref))
+to recognise the regularizer and build its proximal operator.
+"""
+struct TaggedRegularizer{F, P<:NamedTuple}
+    kind::Symbol
+    f::F
+    params::P
+end
+(r::TaggedRegularizer)(arr) = r.f(arr)
+
 
 include("hessian_schatten_norm.jl")
 
@@ -198,8 +213,10 @@ julia> reg([1 2 3; 4 5 6; 7 8 9])
 """
 function Tikhonov(; num_dims=nothing, sum_dims=nothing, weights=nothing, step=1, mode="laplace", _guard=true)
     if _guard
-        return _plane_guarded(Tikhonov, Tikhonov(; num_dims, sum_dims, weights, step, mode, _guard=false);
-                              num_dims, sum_dims, weights, step, mode)
+        return TaggedRegularizer(:Tikhonov,
+                   _plane_guarded(Tikhonov, Tikhonov(; num_dims, sum_dims, weights, step, mode, _guard=false);
+                                  num_dims, sum_dims, weights, step, mode),
+                   (; num_dims, sum_dims, weights, step, mode))
     end
     if mode == "identity"
         return arr -> sum(abs2.(arr))
@@ -446,8 +463,10 @@ julia> reg([1 2 3; 4 5 6; 7 8 9])
 """
 function TV(; num_dims=nothing, sum_dims=nothing, weights=nothing, step=1, mode="forward", ϵ=1f-8, _guard=true)
     if _guard
-        return _plane_guarded(TV, TV(; num_dims, sum_dims, weights, step, mode, ϵ, _guard=false);
-                              num_dims, sum_dims, weights, step, mode, ϵ)
+        return TaggedRegularizer(:TV,
+                   _plane_guarded(TV, TV(; num_dims, sum_dims, weights, step, mode, ϵ, _guard=false);
+                                  num_dims, sum_dims, weights, step, mode, ϵ),
+                   (; num_dims, sum_dims, weights, step, mode, ϵ))
     end
     if !(mode in ("forward", "central"))
         throw(ArgumentError("The provided mode is not valid."))
@@ -519,8 +538,10 @@ of a n-dimensional array.
 """
 function TH(; num_dims=nothing, sum_dims=nothing, weights=nothing, ϵ=1f-8, _guard=true)
     if _guard
-        return _plane_guarded(TH, TH(; num_dims, sum_dims, weights, ϵ, _guard=false);
-                              num_dims, sum_dims, weights, ϵ)
+        return TaggedRegularizer(:TH,
+                   _plane_guarded(TH, TH(; num_dims, sum_dims, weights, ϵ, _guard=false);
+                                  num_dims, sum_dims, weights, ϵ),
+                   (; num_dims, sum_dims, weights, ϵ))
     end
     if isnothing(num_dims)
         if isnothing(sum_dims)

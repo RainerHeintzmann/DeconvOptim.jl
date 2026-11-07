@@ -1,7 +1,7 @@
 using DeconvOptim
 using Test
 using FFTW, Noise, Statistics, Zygote
-using Random
+using Random, LinearAlgebra
 using TestImages, Noise
 using Pkg
 #Pkg.add(url="https://github.com/emmt/OptimPackNextGen.jl")
@@ -30,3 +30,5 @@ include("lossfunctions.jl")
 include("regularizer.jl")
 
 include("main.jl")
+
+include("admm.jl")

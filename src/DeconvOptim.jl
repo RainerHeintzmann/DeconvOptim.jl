@@ -44,6 +44,7 @@ include("lucy_richardson.jl")
 include("map_cj.jl")
 include("map_cj_lean.jl")
 include("map_cj_exact.jl")
+include("admm.jl")
 include("deconvolution.jl")
 include("analysis_tools.jl")
 

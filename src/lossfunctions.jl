@@ -205,6 +205,9 @@ Returns a function to calculate Poisson loss using the Anscombe transform
 Check the help of `anscombe_aux`.
 """
 
-function Anscombe(b=0)
-    (μ, meas, storage=similar(μ)) -> anscombe_aux(μ, meas, storage, b=b)
+struct AnscombeLoss{B}
+    b::B
 end
+(l::AnscombeLoss)(μ, meas, storage=similar(μ)) = anscombe_aux(μ, meas, storage, b=l.b)
+
+Anscombe(b=0) = AnscombeLoss(b)

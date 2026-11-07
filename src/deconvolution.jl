@@ -32,7 +32,10 @@ regularizers and mappings.
     For negative paddings, the absolute value is used, but the result maintains the padded size.
     `padding=0` disables any padding.
 - `opt_package=Opt_Optim`: decides which backend for the optimizer is used.
-- `opt=LBFGS()`: The chosen optimizer which must fit to `opt_package` 
+- `opt=LBFGS()`: The chosen optimizer which must fit to `opt_package`.
+    `opt=ADMM()` selects the AD-free ADMM solver (see [`ADMM`](@ref)) for
+    `Poisson`/`Gauss`/`Anscombe` losses and `TV`/`TH`/`HS`/`Tikhonov` regularizers.
+    The second return value is then an [`ADMMResult`](@ref DeconvOptim.ADMMResult).
 - `opt_options=nothing`: Can be a options file required by Optim.jl. Will overwrite iterations.
 - `initial=mean(measured)`: defines a value (or array) with the initial guess. This will be pulled through the inverse mapping function
                      and extended with a mean value (if border regions are used).
@@ -149,6 +152,23 @@ function deconvolution(measured::AbstractArray{T, N}, psf;
     # the psf should be normalized to 1
     if (normalize_psf)
         psf ./= sum(psf)
+    end
+
+    if opt isa ADMM
+        conv_dims == ntuple(+, ndims(psf)) ||
+            throw(ArgumentError("opt=ADMM() supports only the default conv_dims=1:ndims(psf)"))
+        res_out, res = admm_deconvolution(measured, psf, mf(rec0);
+                                          loss=loss, regularizer=regularizer, λ=λ,
+                                          background=background, opt=opt, iterations=iterations,
+                                          nonneg=!isnothing(mapping), debug_f=debug_f, progress=progress)
+        res_out = copy(res_out)
+        if (normalize_data)
+            res_out .*= rescaling
+        end
+        if padding > 0.0
+            res_out = center_extract(res_out, size(measured))
+        end
+        return res_out, res
     end
 
     otf, conv_temp = plan_conv(rec0, psf, conv_dims)
