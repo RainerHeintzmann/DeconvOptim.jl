@@ -381,9 +381,11 @@ function _lean_model!(c, mu, x)
 end
 
 # per-voxel data loss, its μ-derivative (the residual) and second derivative
+# Poisson loss as deviance (see `_poisson_deviance` in map_cj.jl): differs from
+# mt - g log(mt) only by a data-only constant, but keeps Float32 sums accurate at high counts.
 @inline function _lean_loss(::Val{:poisson}, mu, g, b, offset)
     mt = max(mu + b, eps(typeof(mu)))
-    return mt - g * log(mt)
+    return _poisson_deviance(mt, g)
 end
 @inline _lean_residual(::Val{:poisson}, mu, g, b, offset) =
     1 - g / max(mu + b, eps(typeof(mu)))

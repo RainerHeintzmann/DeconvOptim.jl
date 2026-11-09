@@ -159,7 +159,8 @@ end
         DeconvOptim._lean_model!(c, mu, x)
         inner = DeconvOptim.center_extract(mu, size(measured))
         direct = loss === :poisson ?
-            sum(@. (inner + 1) - measured * log(inner + 1)) :
+            # deviance form: μ - g log μ minus the data-only constant g - g log g
+            sum(@. (inner + 1) - measured - ifelse(measured > 0, measured * log((inner + 1) / measured), 0)) :
             loss === :anscombe ?
             sum(@. abs2(sqrt(inner + 1 + 3 / 8) - sqrt(measured + 3 / 8))) :
             sum(@. abs2(inner + 1 - measured))

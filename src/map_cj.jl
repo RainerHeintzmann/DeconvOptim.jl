@@ -594,13 +594,30 @@ function _mappr_line_eval(alpha, model, m1, m2, data, background, penalty,
     return phi, dphi, d2phi
 end
 
-# Poisson negative log-likelihood sum(μ - g log μ) and its first two
+# Per-voxel Poisson deviance μ - g - g log(μ/g): the negative log-likelihood μ - g log μ minus the
+# data-only constant g - g log g. The minimizer and all derivatives are unchanged, but the terms are
+# ≈ 0 at the optimum. With the plain form, sums of order 1e8 at high counts cannot resolve the
+# decrease of a line-search step in Float32 (eps ≈ 1e-7), so iterations stop prematurely.
+# Evaluated as g (r - log1p(r)) with r = (μ - g)/g, where r - log1p(r) uses its Taylor series for
+# small |r|: the direct form μ - g - g log(μ/g) cancels catastrophically in Float32 at high counts.
+@inline function _poisson_deviance(mu, g)
+    T = typeof(mu)
+    g > zero(g) || return mu
+    r = (mu - g) / g
+    s = abs(r) < T(0.1) ?
+        r * r * (T(1 / 2) - r * (T(1 / 3) - r * (T(1 / 4) - r * (T(1 / 5) - r * (T(1 / 6) -
+            r * (T(1 / 7) - r * (T(1 / 8) - r * T(1 / 9)))))))) :
+        r - log1p(r)
+    return g * s
+end
+
+# Poisson negative log-likelihood (as deviance, see `_poisson_deviance`) and its first two
 # derivatives along the line, given μ, μ' and μ'' per voxel.
 function _mappr_poisson_line(data, mask, mu, mu1, mu2, work)
     if mask === nothing
-        @. work = mu - data * log(mu)
+        @. work = _poisson_deviance(mu, data)
     else
-        @. work = mask * (mu - data * log(mu))
+        @. work = mask * _poisson_deviance(mu, data)
     end
     phi = sum(work)
     if mask === nothing
