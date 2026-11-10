@@ -52,7 +52,8 @@ smoothed Frobenius norm of the Hessian of `x.^2`.
   considered stuck.
 - `padding=0.0`: fractional padding per side, matching `deconvolution`.
   Positive values pad the optimization domain and crop the returned object
-  back to the measured size; negative values retain the padded output.
+  back to the measured size; negative values retain the padded output. One
+  value per dimension (e.g. `(0.05, 0.05, 0.25)`) pads the dimensions differently.
 - `initial=nothing`: initial object estimate (scalar or measured-/padded-size array);
   the optimization starts at its nonnegative square root.
 - `conv_dims=1:ndims(measured)`: dimensions over which to convolve.
@@ -94,8 +95,7 @@ function map_cj(measured::AbstractArray, psf::AbstractArray;
         throw(ArgumentError("`measured` and `psf` must have the same number of dimensions"))
     all(size(psf, d) <= size(measured, d) for d in 1:N) ||
         throw(ArgumentError("`psf` dimensions must not exceed `measured` dimensions"))
-    padding isa Real && isfinite(padding) ||
-        throw(ArgumentError("`padding` must be finite"))
+    _check_padding(padding, N)
     penalty in (:good, :hessian_frobenius) ||
         throw(ArgumentError("`penalty` must be :good or :hessian_frobenius"))
     cg_update in (:fletcher_reeves, :polak_ribiere) ||
@@ -135,16 +135,9 @@ function map_cj(measured::AbstractArray, psf::AbstractArray;
         psf_data ./= psf_sum
     end
 
-    size_padded = ntuple(N) do d
-        if size(measured, d) == 1 || iszero(padding)
-            size(measured, d)
-        else
-            pad = next_fast_fft_size(max(4, 2 * round(Int,
-                size(measured, d) * abs(padding))))
-            size(measured, d) + pad
-        end
-    end
+    size_padded = _padded_size(size(measured), padding)
     padded = any(size_padded[d] != size(measured, d) for d in 1:N)
+    result_size = _result_size(size(measured), size_padded, padding)
     data = similar(measured_data, T, size_padded)
     fill!(data, zero(T))
     mask = padded ? similar(data) : nothing
@@ -346,16 +339,13 @@ function map_cj(measured::AbstractArray, psf::AbstractArray;
         @. object = abs2(x)
         @. model += 2 * alpha * m1 + alpha * alpha * m2
         if callback !== nothing &&
-           callback(iteration, padded && padding > 0 ?
-                    center_extract(object, size(measured_data)) : object,
-                    padded && padding > 0 ?
-                    center_extract(model, size(measured_data)) : model) === true
+           callback(iteration, _crop_result(object, result_size),
+                    _crop_result(model, result_size)) === true
             break
         end
     end
 
-    return padded && padding > 0 ? center_extract(object, size(measured_data)) :
-           object
+    return _crop_result(object, result_size)
 end
 
 # Adds a negative-curvature component to `direction` at voxels that sit (almost)

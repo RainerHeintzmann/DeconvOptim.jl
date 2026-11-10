@@ -31,6 +31,8 @@ include("regularizer.jl")
 
 include("main.jl")
 
+include("padding.jl")
+
 include("admm.jl")
 
 include("positivity.jl")

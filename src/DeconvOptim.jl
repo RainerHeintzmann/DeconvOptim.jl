@@ -41,6 +41,7 @@ include("regularizer.jl")
 include("positivity.jl")
 # include("regularizer_ka.jl")  # is fully functional but not faster and therefor currently not included
 include("utils.jl")
+include("padding.jl")
 include("conv.jl")
 include("generic_invert.jl")
 include("lucy_richardson.jl")

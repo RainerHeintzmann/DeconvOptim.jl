@@ -48,7 +48,8 @@ is copied to the GPU, which saves one volume of GPU memory.
   `gamma` is measured against the scale of `ω`, so normalize it (e.g. to
   mean 1) to keep `gamma` comparable to the unweighted case.
 - `padding=0.0`, `initial=nothing`, `conv_dims`, `normalize_psf=true`,
-  `callback=nothing`: as in `map_cj`.
+  `callback=nothing`: as in `map_cj` (`padding` may give one fraction per
+  dimension, e.g. `(0.05, 0.05, 0.25)`).
 
 The returned array is the reconstructed object `f(x)`.
 """
@@ -203,8 +204,7 @@ function _lean_setup(measured, psf; penalty, loss, anscombe_offset, mapping,
         throw(ArgumentError("`measured` and `psf` must have the same number of dimensions"))
     all(size(psf, d) <= size(measured, d) for d in 1:N) ||
         throw(ArgumentError("`psf` dimensions must not exceed `measured` dimensions"))
-    padding isa Real && isfinite(padding) ||
-        throw(ArgumentError("`padding` must be finite"))
+    _check_padding(padding, N)
     penalty in (:good, :hessian_frobenius) ||
         throw(ArgumentError("`penalty` must be :good or :hessian_frobenius"))
     loss in (:poisson, :anscombe, :gauss) ||
@@ -235,14 +235,7 @@ function _lean_setup(measured, psf; penalty, loss, anscombe_offset, mapping,
             throw(ArgumentError("`psf` must have a positive finite sum when normalized"))
     end
 
-    size_padded = ntuple(N) do d
-        if size(measured, d) == 1 || iszero(padding)
-            size(measured, d)
-        else
-            size(measured, d) + next_fast_fft_size(max(4, 2 * round(Int,
-                size(measured, d) * abs(padding))))
-        end
-    end
+    size_padded = _padded_size(size(measured), padding)
     padded = any(size_padded[d] != size(measured, d) for d in 1:N)
     # `measured` is only read, so it is used directly when no conversion or
     # padding is needed
@@ -361,7 +354,9 @@ function _lean_setup(measured, psf; penalty, loss, anscombe_offset, mapping,
          offset=T(anscombe_offset), mapping=m, penalty=penalty, gamma=T(gamma),
          eps2=eps_hessian^2, weights=dim_weights, pairs=Tuple(pair_list),
          pair_weights=Tuple(T.(pair_weights)), conv! = conv!, padded=padded,
-         crop=padding > 0, measured_size=size(measured), noise_weights=omega)
+         # returned size: measured size where padding > 0, padded where < 0 (per dimension)
+         crop=true, measured_size=_result_size(size(measured), size_padded, padding),
+         noise_weights=omega)
     return c, x
 end
 

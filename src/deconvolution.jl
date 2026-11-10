@@ -25,12 +25,14 @@ regularizers and mappings.
 - `conv_dims`: A tuple indicating over which dimensions the convolution should happen.
                per default `conv_dims=1:ndims(psf)`
 - `plan_fft=true`: Boolean whether plan_fft is used. Gives a slight speed improvement.
-- `padding=0`: an float indicating the amount (fraction of the size in that dimension) 
+- `padding=0`: an float indicating the amount (fraction of the size in that dimension)
     of padded regions around the reconstruction. Prevents wrap around effects of the FFT.
-    A array with `size(arr)=(400, 400)` with `padding=0.05` would result in reconstruction size of 
+    A array with `size(arr)=(400, 400)` with `padding=0.05` would result in reconstruction size of
     `(440, 440)`. However, if padding is >= 0.0, we only return the reconstruction cropped to the original size.
     For negative paddings, the absolute value is used, but the result maintains the padded size.
-    `padding=0` disables any padding.
+    `padding=0` disables any padding. One value per dimension (tuple or vector) pads the dimensions
+    differently, e.g. `padding=(0.05, 0.05, 0.25)` for a 3D wide-field stack, whose out-of-focus light
+    reaches much further along z; the sign rule then applies per dimension.
 - `opt_package=Opt_Optim`: decides which backend for the optimizer is used.
 - `opt=LBFGS()`: The chosen optimizer which must fit to `opt_package`.
     `opt=ADMM()` selects the AD-free ADMM solver (see [`ADMM`](@ref)) for
@@ -95,25 +97,12 @@ function deconvolution(measured::AbstractArray{T, N}, psf;
     # we create a array size_padded which stores a new array size
     # our reconstruction array will be larger than measured
     # to prevent wrap around artifacts
-    size_padded = []
-    for i = 1:ndims(measured)
-        # if the size of the i-th dimension is 1
-        # don't do any padding because there won't be no
-        # convolution in that dimension
-        if size(measured)[i] == 1
-            push!(size_padded, 1)
-        else
-            # only pad, if padding is true
-            if ~iszero(padding)
-                # 2 * ensures symmetric padding
-                # minimum padding is 2 (4 in total) on each side
-                x = next_fast_fft_size(max(4, 2 * round(Int, size(measured)[i] * abs(padding))))
-            else
-                x = 0
-            end
-            push!(size_padded, size(measured)[i] + x)
-        end
-    end
+    # (no padding in singleton dimensions: there is no convolution along them; the border is
+    # symmetric, at least 2 voxels per side; see padding.jl)
+    _check_padding(padding, N)
+    size_padded = _padded_size(size(measured), padding)
+    # returned size: cropped back where padding > 0, padded where padding < 0
+    result_size = _result_size(size(measured), size_padded, padding)
 
     # we divide by the mean to normalize
     if (normalize_data)
@@ -171,9 +160,7 @@ function deconvolution(measured::AbstractArray{T, N}, psf;
         if (normalize_data)
             res_out .*= rescaling
         end
-        if padding > 0.0
-            res_out = center_extract(res_out, size(measured))
-        end
+        res_out = _crop_result(res_out, result_size)
         return res_out, res
     end
 
@@ -207,10 +194,8 @@ function deconvolution(measured::AbstractArray{T, N}, psf;
         res_out .*= rescaling
     end
     # since we do some padding we need to extract the center part
-    # for negative paddings, keep the large size.
-    if padding > 0.0
-        res_out = center_extract(res_out, size(measured))
-    end
+    # for negative paddings, keep the large size (per dimension).
+    res_out = _crop_result(res_out, result_size)
     return res_out, res
 end
 
