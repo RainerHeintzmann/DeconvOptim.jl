@@ -35,4 +35,7 @@ include("padding.jl")
 
 include("admm.jl")
 
+include("chambolle_pock.jl")
+include("sparse_tgv.jl")
+
 include("positivity.jl")

@@ -7,7 +7,13 @@ Tikhonov
 GR
 TH
 HS
+L1
+TGV
 ```
+
+`L1()` and `TGV()` are mainly meant for the splitting solvers: `L1()` works with all solvers
+(with `ADMM()` and `ChambollePock()` through its exact proximal map), `TGV()` only with
+[`ChambollePock`](@ref), which carries its auxiliary vector field.
 
 ## Positivity penalty
 ```@docs

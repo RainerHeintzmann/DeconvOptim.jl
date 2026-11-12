@@ -36,8 +36,11 @@ regularizers and mappings.
 - `opt_package=Opt_Optim`: decides which backend for the optimizer is used.
 - `opt=LBFGS()`: The chosen optimizer which must fit to `opt_package`.
     `opt=ADMM()` selects the AD-free ADMM solver (see [`ADMM`](@ref)) for
-    `Poisson`/`Gauss`/`Anscombe` losses and `TV`/`TH`/`HS`/`Tikhonov` regularizers.
+    `Poisson`/`Gauss`/`Anscombe` losses and `TV`/`TH`/`HS`/`Tikhonov`/`L1` regularizers.
     The second return value is then an [`ADMMResult`](@ref DeconvOptim.ADMMResult).
+    `opt=ChambollePock()` selects the AD-free primal–dual solver (see [`ChambollePock`](@ref)) for
+    the same losses and regularizers and additionally `TGV`; it needs no linear solve. The second return value is then a
+    [`ChambollePockResult`](@ref DeconvOptim.ChambollePockResult).
 - `opt_options=nothing`: Can be a options file required by Optim.jl. Will overwrite iterations.
 - `initial=mean(measured)`: defines a value (or array) with the initial guess. This will be pulled through the inverse mapping function
                      and extended with a mean value (if border regions are used).
@@ -148,14 +151,21 @@ function deconvolution(measured::AbstractArray{T, N}, psf;
         psf ./= sum(psf)
     end
 
-    if opt isa ADMM
+    _reg_kind(regularizer) == :TGV && !(opt isa ChambollePock) &&
+        throw(ArgumentError("TGV() is only supported by opt=ChambollePock()"))
+    if _reg_kind(regularizer) == :L1 && loss === poisson_aux && iszero(background)
+        @warn "L1() with the Poisson loss and no background only rescales the result " *
+              "(the forward model conserves the total intensity); use Gauss() or Anscombe()." maxlog=1
+    end
+    if opt isa ADMM || opt isa ChambollePock
         conv_dims == ntuple(+, ndims(psf)) ||
-            throw(ArgumentError("opt=ADMM() supports only the default conv_dims=1:ndims(psf)"))
-        res_out, res = admm_deconvolution(measured, psf, mf(rec0);
-                                          loss=loss, regularizer=regularizer, λ=λ,
-                                          background=background, opt=opt, iterations=iterations,
-                                          nonneg=!isnothing(mapping) || !isnothing(positivity),
-                                          debug_f=debug_f, progress=progress)
+            throw(ArgumentError("opt=$(nameof(typeof(opt)))() supports only the default conv_dims=1:ndims(psf)"))
+        solver = opt isa ADMM ? admm_deconvolution : chambolle_pock_deconvolution
+        res_out, res = solver(measured, psf, mf(rec0);
+                              loss=loss, regularizer=regularizer, λ=λ,
+                              background=background, opt=opt, iterations=iterations,
+                              nonneg=!isnothing(mapping) || !isnothing(positivity),
+                              debug_f=debug_f, progress=progress)
         res_out = copy(res_out)
         if (normalize_data)
             res_out .*= rescaling

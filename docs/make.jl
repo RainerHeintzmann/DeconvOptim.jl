@@ -19,6 +19,7 @@ makedocs(modules=[DeconvOptim],
                         "workflow/cuda.md",
                         "workflow/flexible_invert.md",
                         "workflow/admm.md",
+                        "workflow/chambolle_pock.md",
                         "workflow/performance_tips.md",
                     ],
                 "Background" => Any[

@@ -38,6 +38,7 @@ include("mappings.jl")
 # special CUDA regularizers
 include("regularizer_cuda.jl")
 include("regularizer.jl")
+include("regularizer_sparse_tgv.jl")
 include("positivity.jl")
 # include("regularizer_ka.jl")  # is fully functional but not faster and therefor currently not included
 include("utils.jl")
@@ -49,6 +50,7 @@ include("map_cj.jl")
 include("map_cj_lean.jl")
 include("map_cj_exact.jl")
 include("admm.jl")
+include("chambolle_pock.jl")
 include("deconvolution.jl")
 include("analysis_tools.jl")
 

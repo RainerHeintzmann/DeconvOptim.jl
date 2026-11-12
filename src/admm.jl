@@ -30,12 +30,15 @@ export ADMM
            check_every=10, ρ_balance=10, ρ_factor=2)
 
 Select the ADMM solver in [`deconvolution`](@ref) via `opt=ADMM()`.
-No automatic differentiation is used. ADMM minimizes the exact (non-smoothed)
-objective and enforces non-negativity by projection instead of a mapping.
+No automatic differentiation is used. ADMM enforces non-negativity by projection instead of a
+mapping. The smoothing constant `ϵ` of `TV()`/`TH()` becomes the threshold `δ = √ϵ` of a Huber
+norm (quadratic below `δ`, linear above; same curvature at 0 and same asymptote as the smoothing
+`√(‖∇x‖² + ϵ)` of the gradient-based path); the default `ϵ = 1f-8` is practically the exact
+(non-smoothed) norm. `HS()` is always exact.
 
 Supported combinations:
 - `loss`: `Poisson()`, `Gauss()`, `Anscombe(b)`
-- `regularizer`: `nothing`, `TV()`, `TH()`, `HS()` (only `p=1`), `Tikhonov()` (all modes)
+- `regularizer`: `nothing`, `TV()`, `TH()`, `HS()` (only `p=1`), `Tikhonov()` (all modes), `L1()`
 - `mapping`: any non-`nothing` mapping is interpreted as `x ≥ 0`, `nothing` as unconstrained.
 
 Boundaries of the reconstruction grid are periodic. Use `padding>0` in
@@ -204,10 +207,15 @@ end
 # ---------------------------------------------------------------------------
 # kind = :group    → prox of λ Σᵢ ‖(z₁ᵢ, …, zₖᵢ)‖₂ (isotropic shrinkage; TV, TH)
 # kind = :schatten → prox of λ Σᵢ ‖[[a, c/√2], [c/√2, d]]ᵢ‖_S1, components (a, d, c)
+# δ > 0 (group blocks only): Huber norm  H_δ(‖z‖) = ‖z‖²/(2δ) for ‖z‖ ≤ δ, ‖z‖ − δ/2 otherwise,
+# which matches the smoothing √(‖z‖² + ϵ) of the gradient-based path with δ = √ϵ (same curvature
+# at 0, same asymptote)
 struct SplitBlock{S}
     kind::Symbol
     stencils::Vector{S}
+    δ::Float64
 end
+SplitBlock(kind::Symbol, sts::Vector{S}) where S = SplitBlock{S}(kind, sts, 0.0)
 
 _sum_dims(sum_dims, N) = isnothing(sum_dims) ? collect(1:N) : [d for d in sum_dims if d <= N]
 _weights(weights, n, T) = isnothing(weights) ? ones(T, n) : T.(collect(weights))
@@ -219,6 +227,11 @@ function admm_reg(reg::Nothing, N, T)
 end
 
 function admm_reg(reg::TaggedRegularizer, N, T)
+    S = Stencil{N, T}
+    # L1: no operator, the ℓ1 term is merged into the proximal map of the x ≥ 0 split (ADMM) or
+    # of the primal step (Chambolle–Pock)
+    reg.kind == :L1 && return SplitBlock{S}[], S[]
+    reg.kind == :TGV && throw(ArgumentError("TGV() is only supported by opt=ChambollePock()"))
     p = reg.params
     nd = isnothing(p.num_dims) ? N : min(p.num_dims, N)
     sd = _sum_dims(p.sum_dims, nd)
@@ -228,7 +241,7 @@ function admm_reg(reg::TaggedRegularizer, N, T)
         st = p.step
         o2 = p.mode == "central" ? -st : 0
         sts = S[Stencil([_unit(N, d, st), _unit(N, d, o2)], T[sqrt(wk), -sqrt(wk)]) for (d, wk) in zip(sd, w)]
-        return [SplitBlock(:group, sts)], S[]
+        return [SplitBlock(:group, sts, sqrt(Float64(p.ϵ)))], S[]
     elseif reg.kind == :TH
         sts = S[_diff2(N, d, wk, T) for (d, wk) in zip(sd, w)]
         for k in eachindex(sd), l in k+1:length(sd)
@@ -237,7 +250,7 @@ function admm_reg(reg::TaggedRegularizer, N, T)
             push!(sts, Stencil([_unit(N, d, 1) .+ _unit(N, e, 1), _unit(N, d, 1), _unit(N, e, 1), _unit(N, d, 0)],
                                T[c, -c, -c, c]))
         end
-        return [SplitBlock(:group, sts)], S[]
+        return [SplitBlock(:group, sts, sqrt(Float64(p.ϵ)))], S[]
     elseif reg.kind == :Tikhonov
         if p.mode == "identity"
             return SplitBlock{S}[], S[Stencil([_unit(N, 1, 0)], T[1])]
@@ -271,7 +284,12 @@ function admm_reg(reg::HessianSchattenNorm, N, T)
 end
 
 admm_reg(reg, N, T) = throw(ArgumentError(
-    "This regularizer is not supported by ADMM. Use `nothing`, `TV()`, `TH()`, `HS()` or `Tikhonov()`."))
+    "This regularizer is not supported by ADMM. Use `nothing`, `TV()`, `TH()`, `HS()`, `Tikhonov()` or `L1()`."))
+
+_is_l1(reg) = _reg_kind(reg) == :L1
+
+# shrinkage factor of the prox of κ·H_δ(‖v‖) (Huber; δ = 0: the norm itself), n = ‖v‖
+@inline _group_shrink(n, κ, δ) = n > δ + κ ? one(n) - κ / n : δ / max(δ + κ, floatmin(n))
 
 # ---------------------------------------------------------------------------
 # proximal operators of the data terms:  argmin_u  f(u + bg) + ρ/2 (u - v)²
@@ -338,12 +356,12 @@ _prox_apply!(pr, z, v, y, mask) = _tb!((vv, yy, mm) -> mm > 0 ? pr(vv, yy) : vv,
 # ---------------------------------------------------------------------------
 # proximal operators of the split regularizer blocks (in place, v → z)
 # ---------------------------------------------------------------------------
-function prox_block!(zs, kind, vs, κ, s1, s2)
+function prox_block!(zs, kind, vs, κ, δ, s1, s2)
     T = eltype(s1)
     if kind == :group
-        # shrinkage factor max(1 - κ/‖v‖, 0) in one pass over all components
-        o, z0, tiny = one(T), zero(T), floatmin(T)   # values, not the type T (GPU kernels need isbits closures)
-        _tb!((v...) -> max(o - κ / sqrt(sum(abs2, v) + tiny), z0), s1, vs...)
+        # shrinkage factor (max(1 - κ/‖v‖, 0) for δ = 0) in one pass over all components
+        δT = T(δ)                                    # a value, not the type T (GPU kernels need isbits closures)
+        _tb!((v...) -> _group_shrink(sqrt(sum(abs2, v)), κ, δT), s1, vs...)
         for k in eachindex(vs)
             _tb!(*, zs[k], s1, vs[k])
         end
@@ -373,11 +391,11 @@ end
 # fused elementwise prox update (CPU): one pass reads v (held in w), writes
 # z = prox(v) and w = v - z for all components of a block
 # ---------------------------------------------------------------------------
-@inline function _pix_prox(::Val{:group}, v::NTuple{K, T}, κ) where {K, T}
-    f = max(one(T) - κ / sqrt(sum(abs2, v) + floatmin(T)), zero(T))
+@inline function _pix_prox(::Val{:group}, v::NTuple{K, T}, κ, δ) where {K, T}
+    f = _group_shrink(sqrt(sum(abs2, v)), κ, δ)
     return map(vi -> f * vi, v)
 end
-@inline function _pix_prox(::Val{:schatten}, v::NTuple{3, T}, κ) where T
+@inline function _pix_prox(::Val{:schatten}, v::NTuple{3, T}, κ, δ) where T
     a, d, c = v
     r = sqrt(abs2((a - d) / 2) + abs2(c) / 2)
     m = (a + d) / 2
@@ -399,13 +417,13 @@ function _tchunks(f, L)
     return nothing
 end
 
-function _prox_update!(::Val{K}, kind::Val, zs, ws, κ) where K
+function _prox_update!(::Val{K}, kind::Val, zs, ws, κ, δ) where K
     zt = ntuple(k -> zs[k], Val(K))
     wt = ntuple(k -> ws[k], Val(K))
     _tchunks(length(wt[1])) do lo, hi
         @inbounds @simd for i in lo:hi
             v = map(w -> w[i], wt)
-            z = _pix_prox(kind, v, κ)
+            z = _pix_prox(kind, v, κ, δ)
             map((za, zi) -> (za[i] = zi), zt, z)
             map((wa, vi, zi) -> (wa[i] = vi - zi), wt, v, z)
         end
@@ -449,6 +467,7 @@ function admm_deconvolution(measured::AbstractArray{T}, psf, x0;
 
     lossp = admm_loss(loss, T)
     blocks, tik = admm_reg(regularizer, N, T)
+    l1 = _is_l1(regularizer)
 
     # --- kernel on the reconstruction grid (identity along non-PSF dimensions)
     h = similar(x0); fill!(h, zero(T))
@@ -555,9 +574,9 @@ function admm_deconvolution(measured::AbstractArray{T}, psf, x0;
                 end
             end
             if fused
-                _prox_update!(Val(length(b.stencils)), Val(b.kind), zs[bi], vs, T(λT / ρ))
+                _prox_update!(Val(length(b.stencils)), Val(b.kind), zs[bi], vs, T(λT / ρ), T(b.δ))
             else
-                prox_block!(zs[bi], b.kind, vs, T(λT / ρ), s1, s2)
+                prox_block!(zs[bi], b.kind, vs, T(λT / ρ), b.δ, s1, s2)
                 foreach(k -> _tb!(-, vs[k], vs[k], zs[bi][k]), eachindex(b.stencils))
             end
             for k in eachindex(b.stencils)
@@ -568,11 +587,14 @@ function admm_deconvolution(measured::AbstractArray{T}, psf, x0;
                 end
             end
         end
-        # positivity block
+        # positivity block (with L1(): prox of λ‖z‖₁ (+ ι_{z ≥ 0}), i.e. (one-sided) soft thresholding)
         check && copyto!(s2, z3)
+        κ1 = l1 ? T(λT / ρ) : zero(T)
         if nonneg
             z0 = zero(T)
-            _tb!((a, b) -> max(a + b, z0), z3, x, w3)
+            _tb!((a, b) -> max(a + b - κ1, z0), z3, x, w3)
+        elseif l1
+            _tb!((a, b) -> _soft(a + b, κ1), z3, x, w3)
         else
             _tb!(+, z3, x, w3)
         end
