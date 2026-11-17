@@ -12,6 +12,12 @@
         ps = DeconvOptim._padded_size((24, 20, 12), (0.0, 0.1, 0.5))
         @test ps[1] == 24 && ps[2] > 20 && ps[3] > 12
         @test DeconvOptim._padded_size((24, 1, 12), (0.1, 0.1, 0.1))[2] == 1     # no padding of singletons
+        # the whole padded grid gets an FFT-friendly size (was: only the padding), at least 4 more voxels
+        for n in (24, 100, 101, 127, 250), p in (0.01, 0.05, 0.1, -0.25)
+            m = DeconvOptim._padded_size((n,), p)[1]
+            @test m == DeconvOptim.next_fast_fft_size(m) && m >= n + max(4, 2 * round(Int, n * abs(p)))
+        end
+        @test DeconvOptim._padded_size((100,), 0.05) == (112,)                   # 110 = 2·5·11 before
         @test DeconvOptim._result_size((24, 20, 12), (28, 24, 20), (0.1, -0.1, 0.25)) == (24, 24, 12)
         @test_throws ArgumentError DeconvOptim._check_padding((0.1, 0.1), 3)
         @test_throws ArgumentError DeconvOptim._check_padding((0.1, NaN, 0.1), 3)

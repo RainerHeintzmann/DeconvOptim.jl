@@ -3,8 +3,10 @@
 # dimension as a tuple or vector, e.g. `(0.05, 0.05, 0.25)` for a 3D wide-field stack, whose
 # out-of-focus light reaches much further along z than laterally.
 #
-# Per dimension d with fraction p = padding[d] (and size n > 1), the grid grows by
-# `next_fast_fft_size(max(4, 2 round(n |p|)))` voxels (split over both sides); p = 0 does not pad.
+# Per dimension d with fraction p = padding[d] (and size n > 1), the grid grows by at least
+# `max(4, 2 round(n |p|))` voxels (split over both sides), to the next FFT-friendly size
+# (`next_fast_fft_size`, 2·3·5·7-smooth) of the whole grid -- the FFT speed depends on the total
+# size, not on the padding; p = 0 does not pad.
 # The result is cropped back to the measured size in dimensions with p > 0 and keeps the padded
 # size where p < 0.
 
@@ -24,7 +26,7 @@ _padding_fraction(p, d) = p[d]
 "padded grid size for data of size `sz`"
 _padded_size(sz::Tuple, padding) = ntuple(length(sz)) do d
     p = _padding_fraction(padding, d)
-    (sz[d] == 1 || iszero(p)) ? sz[d] : sz[d] + next_fast_fft_size(max(4, 2 * round(Int, sz[d] * abs(p))))
+    (sz[d] == 1 || iszero(p)) ? sz[d] : next_fast_fft_size(sz[d] + max(4, 2 * round(Int, sz[d] * abs(p))))
 end
 
 "size of the returned result: measured size where the padding is ≥ 0, padded size where it is < 0"
